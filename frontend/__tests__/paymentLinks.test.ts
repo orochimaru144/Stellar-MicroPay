@@ -2,23 +2,40 @@
  * @jest-environment jsdom
  */
 import {
-  buildPaymentLinkUrl,
   canRedeemPaymentLink,
   clearPaymentLinkStore,
   getPaymentLinkRecord,
   listPaymentLinks,
   markPaymentLinkRedeemed,
-  parsePaymentLinkQuery,
   paymentLinkId,
   rememberPaymentLink,
   type PaymentLinkPayload,
 } from "@/lib/paymentLinks";
+import { buildSep0007Uri, parseStellarURI } from "@/lib/sep0007";
 
 const PAYLOAD: PaymentLinkPayload = {
   destination: "GABCDEF",
   amount: "10",
   memo: "thanks",
 };
+
+describe("SEP-0007 payment URI round trips", () => {
+  const destination = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+  it.each([
+    ["1", undefined],
+    ["0.00001", "invoice-1"],
+    ["100", "coffee & cake"],
+    ["42.5", "memo/with?reserved=chars"],
+    ["0.1", "unicode ✓"],
+  ])("preserves amount and memo (%s)", (amount, memo) => {
+    const uri = buildSep0007Uri({ destination, amount, memo });
+    const parsed = parseStellarURI(uri);
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toMatchObject({ destination, amount, memo });
+    if (!memo) expect(uri).not.toContain("&memo=");
+  });
+});
 
 describe("paymentLinkId", () => {
   it("is deterministic for the same payload", () => {
@@ -35,84 +52,10 @@ describe("paymentLinkId", () => {
 
   it("normalizes whitespace and missing memo", () => {
     expect(
-      paymentLinkId({
-        destination: "  GABC  ",
-        amount: " 10 ",
-        memo: undefined,
-      }),
-    ).toBe(paymentLinkId({ destination: "GABC", amount: "10", memo: "" }));
-  });
-});
-
-describe("shareable payment link urls", () => {
-  it("builds explicit /pay query params", () => {
-    const url = buildPaymentLinkUrl("https://example.com", {
-      ...PAYLOAD,
-      validUntil: 1893456000000,
-    });
-    expect(url).toBe(
-      "https://example.com/pay?to=GABCDEF&amount=10&memo=thanks&expires=1893456000000",
+      paymentLinkId({ destination: "  GABC  ", amount: " 10 ", memo: undefined })
+    ).toBe(
+      paymentLinkId({ destination: "GABC", amount: "10", memo: "" })
     );
-  });
-
-  it("omits empty optional fields", () => {
-    expect(
-      buildPaymentLinkUrl("https://example.com", {
-        destination: "GABCDEF",
-        amount: "10",
-        memo: "   ",
-      }),
-    ).toBe("https://example.com/pay?to=GABCDEF&amount=10");
-  });
-
-  it("parses query params into payment form prefill payload", () => {
-    expect(
-      parsePaymentLinkQuery({
-        to: "GABCDEF",
-        amount: "10",
-        memo: "coffee",
-        expires: "1893456000000",
-      }),
-    ).toEqual({
-      ok: true,
-      payload: {
-        destination: "GABCDEF",
-        amount: "10",
-        memo: "coffee",
-        validUntil: 1893456000000,
-      },
-    });
-  });
-
-  it("parses unix-second expiry timestamps", () => {
-    expect(
-      parsePaymentLinkQuery({
-        to: "GABCDEF",
-        amount: "10",
-        expires: "1893456000",
-      }),
-    ).toEqual({
-      ok: true,
-      payload: {
-        destination: "GABCDEF",
-        amount: "10",
-        validUntil: 1893456000000,
-      },
-    });
-  });
-
-  it("rejects invalid expiry timestamps", () => {
-    expect(
-      parsePaymentLinkQuery({ to: "GABCDEF", amount: "10", expires: "soon" }),
-    ).toEqual({ ok: false, reason: "invalid-expiry" });
-  });
-
-  it("keeps parsing legacy base64 data links", () => {
-    const data = btoa(JSON.stringify(PAYLOAD));
-    expect(parsePaymentLinkQuery({ data })).toEqual({
-      ok: true,
-      payload: { ...PAYLOAD, validUntil: null },
-    });
   });
 });
 
@@ -122,12 +65,9 @@ describe("payment link store", () => {
   });
 
   it("remembers a freshly generated link as pending", () => {
-    const record = rememberPaymentLink(
-      PAYLOAD,
-      "https://example/pay?to=GABCDEF&amount=10",
-    );
+    const record = rememberPaymentLink(PAYLOAD, "https://example/pay?data=…");
     expect(record.status).toBe("pending");
-    expect(record.url).toContain("to=GABCDEF");
+    expect(record.url).toContain("data");
     expect(getPaymentLinkRecord(PAYLOAD)?.status).toBe("pending");
   });
 
@@ -180,7 +120,7 @@ describe("canRedeemPaymentLink", () => {
 
   it("rejects expired links via the validUntil field", () => {
     expect(
-      canRedeemPaymentLink({ ...PAYLOAD, validUntil: Date.now() - 1 }),
+      canRedeemPaymentLink({ ...PAYLOAD, validUntil: Date.now() - 1 })
     ).toEqual({ ok: false, reason: "expired" });
   });
 

@@ -1,156 +1,191 @@
-/**
- * __tests__/CreatorTipsDashboard.test.tsx
- * Tests for the CSV export button and timeout/offline/unmount behavior on the
- * creator tips dashboard (#612).
- */
+import type { AnchorHTMLAttributes } from "react";
+import { render, screen, within } from "@testing-library/react";
+import CreatorTipsDashboard from "@/components/CreatorTipsDashboard";
 
-import React from "react";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
-import "@testing-library/jest-dom";
-import CreatorTipsDashboard from "../components/CreatorTipsDashboard";
-import { exportTipsToCSV } from "@/utils/format";
-
-jest.mock("@/utils/format", () => ({
-  ...jest.requireActual("@/utils/format"),
-  exportTipsToCSV: jest.fn(),
+jest.mock("next/link", () => ({
+  __esModule: true,
+  default: ({
+    children,
+    href,
+    ...props
+  }: AnchorHTMLAttributes<HTMLAnchorElement> & { href: string }) => (
+    <a href={href} {...props}>
+      {children}
+    </a>
+  ),
 }));
 
-const mockTips = [
-  {
+const CREATOR = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const SENDER_ONE = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const SENDER_TWO = "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+const originalFetch = global.fetch;
+const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+
+function jsonResponse(data: unknown, ok = true) {
+  return {
+    ok,
+    json: async () => data,
+  } as Response;
+}
+
+function tipsPayload(
+  tips: Array<Record<string, unknown>>,
+  stats: Record<string, unknown>,
+) {
+  return {
+    success: true,
+    data: {
+      tips,
+      total: tips.length,
+      limit: 10,
+      offset: 0,
+      stats,
+    },
+  };
+}
+
+function tip(overrides: Record<string, unknown> = {}) {
+  return {
     id: 1,
-    senderPublicKey: "GABC123SENDERPUBLICKEY",
-    creatorPublicKey: "GXYZ789CREATORPUBLICKEY",
-    amount: "5.0000000",
+    senderPublicKey: SENDER_ONE,
+    creatorPublicKey: CREATOR,
+    amount: "10",
     asset: "XLM",
-    memo: "Great content!",
-    txHash: "abc123",
-    timestamp: "2026-07-20T10:00:00Z",
-  },
-];
+    memo: "Thanks for the helpful guide",
+    txHash: "a".repeat(64),
+    timestamp: "2026-01-02T03:04:05.000Z",
+    ...overrides,
+  };
+}
 
-const deferred = () => {
-  let resolve!: (value: unknown) => void;
-  const promise = new Promise((r) => (resolve = r));
-  return { promise, resolve };
-};
-
-describe("CreatorTipsDashboard CSV export", () => {
+describe("CreatorTipsDashboard", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    global.fetch = jest.fn();
+    delete process.env.NEXT_PUBLIC_API_URL;
+    global.fetch = jest.fn().mockRejectedValue(new Error("Unexpected network request"));
   });
 
-  it("exports the currently visible tips when the export button is clicked", async () => {
-    (fetch as jest.Mock).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        success: true,
-        data: {
-          tips: mockTips,
-          stats: {
-            totalTips: 1,
-            totalByAsset: { XLM: { count: 1, amount: "5.0000000" } },
-            averageTip: "5.0000000",
-            largestTip: "5.0000000",
-            smallestTip: "5.0000000",
-          },
-        },
+  afterEach(() => {
+    jest.restoreAllMocks();
+    global.fetch = originalFetch;
+    if (originalApiUrl === undefined) {
+      delete process.env.NEXT_PUBLIC_API_URL;
+    } else {
+      process.env.NEXT_PUBLIC_API_URL = originalApiUrl;
+    }
+  });
+
+  it("shows the per-asset totals aggregated by the backend and recent tip records", async () => {
+    const tips = [
+      tip({ id: 1, amount: "10.0", memo: "First tip" }),
+      tip({
+        id: 2,
+        senderPublicKey: SENDER_TWO,
+        amount: "5.0",
+        memo: "Second tip",
+        timestamp: "2026-01-01T03:04:05.000Z",
       }),
-    });
+      tip({
+        id: 3,
+        amount: "15.0",
+        asset: "USDC",
+        memo: "",
+        timestamp: "2025-12-31T03:04:05.000Z",
+      }),
+    ];
+    const stats = {
+      totalTips: 3,
+      totalByAsset: {
+        XLM: { count: 2, amount: "15" },
+        USDC: { count: 1, amount: "15" },
+      },
+      averageTip: "10",
+      largestTip: "15",
+      smallestTip: "5",
+    };
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(jsonResponse(tipsPayload(tips, stats))) as jest.Mock;
 
-    render(<CreatorTipsDashboard publicKey="GXYZ789CREATORPUBLICKEY" username="alice" />);
-
-    const exportButton = await screen.findByText("Export CSV");
-    await waitFor(() => {
-      expect(exportButton.closest("button")).not.toBeDisabled();
-    });
-
-    fireEvent.click(exportButton);
-
-    await waitFor(() => {
-      expect(exportTipsToCSV).toHaveBeenCalledWith(mockTips);
-    });
-  });
-
-  it("disables the export button when there are no tips", async () => {
-    (fetch as jest.Mock).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ success: true, data: { tips: [], stats: null } }),
-    });
-
-    render(<CreatorTipsDashboard publicKey="GXYZ789CREATORPUBLICKEY" username="alice" />);
-
-    const exportButton = await screen.findByText("Export CSV");
-    expect(exportButton.closest("button")).toBeDisabled();
-  });
-});
-
-describe("CreatorTipsDashboard timeout + offline error handling", () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-    global.fetch = jest.fn();
-  });
-
-  it("shows a timeout message when the request overruns its budget", async () => {
-    jest.useFakeTimers();
-    (fetch as jest.Mock).mockImplementation(
-      (_url: string, init: RequestInit) =>
-        new Promise((resolve, reject) => {
-          const onAbort = () => {
-            reject(new DOMException("The operation was aborted", "AbortError"));
-            (init.signal as AbortSignal).removeEventListener("abort", onAbort);
-          };
-          (init.signal as AbortSignal).addEventListener("abort", onAbort);
-        })
+    render(
+      <CreatorTipsDashboard
+        publicKey={CREATOR}
+        username="creator"
+        xlmPrice={0.2}
+      />,
     );
 
-    render(<CreatorTipsDashboard publicKey="GXYZ789CREATORPUBLICKEY" username="alice" />);
-
-    await jest.advanceTimersByTimeAsync(10_000 + 1);
-
-    await waitFor(() => {
-      expect(
-        screen.getByText("Loading tips timed out. Please try again.")
-      ).toBeInTheDocument();
-    });
-
-    jest.useRealTimers();
+    expect(await screen.findByText("3")).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Total XLM Received").parentElement!).getByText("15"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("10.00")).toBeInTheDocument();
+    expect(screen.getByText("10.0 XLM")).toBeInTheDocument();
+    expect(screen.getByText("5.0 XLM")).toBeInTheDocument();
+    expect(screen.getByText("15.0 USDC")).toBeInTheDocument();
+    expect(screen.getByText('"First tip"')).toBeInTheDocument();
+    expect(global.fetch).toHaveBeenCalledWith(
+      `/api/tips/received/${encodeURIComponent(CREATOR)}?limit=10&offset=0`,
+    );
   });
 
-  it("shows an offline message when the request fails with a TypeError", async () => {
-    (fetch as jest.Mock).mockRejectedValue(new TypeError("Failed to fetch"));
+  it("renders the empty state and zero totals when the backend returns no tips", async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          tipsPayload([], {
+            totalTips: 0,
+            totalByAsset: {},
+            averageTip: null,
+            largestTip: null,
+            smallestTip: null,
+          }),
+        ),
+      ) as jest.Mock;
 
-    render(<CreatorTipsDashboard publicKey="GXYZ789CREATORPUBLICKEY" username="alice" />);
+    render(<CreatorTipsDashboard publicKey={CREATOR} username="creator" />);
 
-    await waitFor(() => {
-      expect(
-        screen.getByText("You appear to be offline. Check your connection and try again.")
-      ).toBeInTheDocument();
-    });
+    expect(await screen.findByText("No tips received yet")).toBeInTheDocument();
+    expect(screen.getByText("Share your tip page to start receiving tips!")).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Total Tips Received").parentElement!).getByText("0"),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Total XLM Received").parentElement!).getByText("0"),
+    ).toBeInTheDocument();
   });
-});
 
-describe("CreatorTipsDashboard unmount cancellation", () => {
-  it("aborts the in-flight request when the component unmounts", async () => {
-    const { promise, resolve } = deferred();
-    const abortSpy = jest.fn();
-    global.fetch = jest.fn((_url: string, init: RequestInit) => {
-      const signal = init.signal as AbortSignal;
-      signal.addEventListener("abort", abortSpy);
-      return promise;
-    }) as jest.Mock;
+  it("shows an error rather than presenting a failed API response as an empty success", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      jsonResponse({ success: false, error: "Service unavailable" }, false),
+    ) as jest.Mock;
+    jest.spyOn(console, "error").mockImplementation(() => {});
 
-    const { unmount } = render(
-      <CreatorTipsDashboard publicKey="GXYZ789CREATORPUBLICKEY" username="alice" />
+    render(<CreatorTipsDashboard publicKey={CREATOR} username="creator" />);
+
+    expect(
+      await screen.findByText(
+        "Unable to load tips. Make sure you have a registered username.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("No tips received yet")).not.toBeInTheDocument();
+    expect(
+      within(screen.getByText("Total Tips Received").parentElement!).getByText("0"),
+    ).toBeInTheDocument();
+    expect(console.error).toHaveBeenCalledWith(
+      "Error fetching tips:",
+      expect.any(Error),
+    );
+  });
+
+  it("shows the loading skeleton before the API request resolves", () => {
+    global.fetch = jest.fn(() => new Promise(() => {})) as jest.Mock;
+
+    const { container } = render(
+      <CreatorTipsDashboard publicKey={CREATOR} username="creator" />,
     );
 
-    expect(abortSpy).not.toHaveBeenCalled();
-    unmount();
-
-    // The component aborts its AbortController on unmount.
-    expect(abortSpy).toHaveBeenCalled();
-
-    resolve({ ok: true, json: async () => ({ success: true, data: { tips: [], stats: null } }) });
-    cleanup();
+    expect(container.querySelectorAll(".animate-pulse")).toHaveLength(3);
+    expect(screen.queryByText("No tips received yet")).not.toBeInTheDocument();
   });
 });

@@ -12,7 +12,7 @@ const config: Config = {
     extend: {
       colors: {
         stellar: {
-          50:  "#f0f9ff",
+          50: "#f0f9ff",
           100: "#e0f2fe",
           200: "#bae6fd",
           300: "#7dd3fc",
@@ -39,6 +39,9 @@ const config: Config = {
         "pulse-slow": "pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite",
         "fade-in": "fadeIn 0.5s ease-in-out",
         "slide-up": "slideUp 0.4s ease-out",
+        "slide-down": "slideDown 0.25s ease-out",
+        // Used by the Live Events feed: each new contract event slides in.
+        "slide-in": "slideIn 0.35s ease-out",
       },
       keyframes: {
         fadeIn: {
@@ -49,37 +52,18 @@ const config: Config = {
           "0%": { opacity: "0", transform: "translateY(16px)" },
           "100%": { opacity: "1", transform: "translateY(0)" },
         },
+        slideDown: {
+          "0%": { opacity: "0", transform: "translateY(-8px)" },
+          "100%": { opacity: "1", transform: "translateY(0)" },
+        },
+        slideIn: {
+          "0%": { opacity: "0", transform: "translateX(-12px)" },
+          "100%": { opacity: "1", transform: "translateX(0)" },
+        },
       },
     },
+    plugins: [],
   },
-  plugins: [],
 };
 
 export default config;
-
-/**
- * RTL/LTR Support Audit for Issue #642
- * 
- * The current Tailwind config uses standard left/right utilities.
- * For RTL support (e.g., Arabic), the following should be updated:
- * 
- * 1. Replace left/right with logical properties:
- *    - `ml-` → `ms-` (margin-start)
- *    - `mr-` → `me-` (margin-end)
- *    - `pl-` → `ps-` (padding-start)
- *    - `pr-` → `pe-` (padding-end)
- *    - `text-left` → `text-start`
- *    - `text-right` → `text-end`
- *    - `rounded-l-` → `rounded-s-`
- *    - `rounded-r-` → `rounded-e-`
- *    - `border-l-` → `border-s-`
- *    - `border-r-` → `border-e-`
- * 
- * 2. Key files to update:
- *    - components/Navbar.tsx (uses ml-, mr-, pl-, pr-)
- *    - pages/dashboard.tsx (uses various left/right utilities)
- * 
- * 3. Current status: All supported locales (en, es) are LTR, so this is
- *    preparation for future RTL locales. The logical properties work
- *    correctly for both LTR and RTL languages.
- */

@@ -5,7 +5,14 @@
 
 "use strict";
 
+const path = require("path");
+
 const swaggerJsdoc = require("swagger-jsdoc");
+
+// Route files scanned for JSDoc `@swagger` annotations. Federation, analytics,
+// and turrets operations are documented in their route files; the remaining
+// operations are defined statically in `definition.paths` below.
+const routesGlob = `${path.join(__dirname, "routes").split(path.sep).join("/")}/*.js`;
 
 const options = {
   definition: {
@@ -14,21 +21,7 @@ const options = {
       title: "Stellar MicroPay API",
       version: "1.0.0",
       description:
-        "Backend API for Stellar MicroPay — instant micropayments on the Stellar network.\n\n" +
-        "## Rate Limiting\n\n" +
-        "All endpoints are rate-limited. Two limiters apply:\n\n" +
-        "| Limiter | Window | Limit | Routes |\n" +
-        "|---------|--------|-------|--------|\n" +
-        "| Global | 15 minutes | 100 req/IP | All routes |\n" +
-        "| Strict | 1 minute | 20 req/IP | `/api/turrets/*` |\n\n" +
-        "Every response includes the following headers so clients can implement back-off:\n\n" +
-        "| Header | Description |\n" +
-        "|--------|-------------|\n" +
-        "| `RateLimit-Limit` | Maximum requests allowed in the current window |\n" +
-        "| `RateLimit-Remaining` | Requests remaining before the limit is reached |\n" +
-        "| `RateLimit-Reset` | Seconds until the window resets |\n\n" +
-        "When the limit is exceeded the server returns **HTTP 429** with `{ \"error\": \"Too many requests, please try again later.\" }`. " +
-        "Clients should read `RateLimit-Remaining` on each response and add exponential back-off when the value approaches 0.",
+        "Backend API for Stellar MicroPay — instant micropayments on the Stellar network.",
       contact: {
         name: "Stellar MicroPay",
         url: "https://github.com/Emmy123222/Stellar-MicroPay",
@@ -41,6 +34,14 @@ const options = {
       },
     ],
     components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "JWT",
+          description: "SEP-0010 JWT obtained from POST /api/auth",
+        },
+      },
       schemas: {
         Error: {
           type: "object",
@@ -91,94 +92,86 @@ const options = {
             publicKey: { type: "string" },
             totalSentXLM: { type: "string" },
             totalReceivedXLM: { type: "string" },
-            sentCount: { type: "integer" },
-            receivedCount: { type: "integer" },
+            uniqueCounterparties: { type: "integer" },
+            averageTransactionSize: { type: "string" },
             totalTransactions: { type: "integer" },
           },
         },
         TopRecipient: {
           type: "object",
           properties: {
-            publicKey: { type: "string" },
-            totalXLM: { type: "string" },
-            count: { type: "integer" },
+            address: { type: "string" },
+            totalXLMSent: { type: "string" },
           },
         },
         ActivityDay: {
           type: "object",
           properties: {
-            date: { type: "string", format: "date" },
-            totalXLM: { type: "string" },
-            count: { type: "integer" },
+            day: { type: "string", example: "Monday" },
+            dayIndex: { type: "integer", minimum: 0, maximum: 6 },
+            transactionCount: { type: "integer" },
           },
         },
-        CohortCounterpartySummary: {
+        TurretsChallenge: {
           type: "object",
           properties: {
-            oneTimeCounterparties: { type: "integer" },
-            repeatCounterparties: { type: "integer" },
-            totalCounterparties: { type: "integer" },
-          },
-        },
-        CohortPeriod: {
-          type: "object",
-          properties: {
-            periodStart: { type: "string", format: "date-time" },
-            periodEnd: { type: "string", format: "date-time" },
-            label: { type: "string" },
-            period: { type: "string", enum: ["month", "week"] },
-            sent: {
+            challengeXDR: {
+              type: "string",
+              description: "ManageData challenge transaction to sign and deploy.",
+            },
+            deploymentHash: { type: "string" },
+            normalizedConfig: {
               type: "object",
-              properties: {
-                paymentCount: { type: "integer" },
-                totalXLM: { type: "string" },
-                counterparties: { $ref: "#/components/schemas/CohortCounterpartySummary" },
-              },
+              description: "Configuration after validation and normalization.",
             },
-            received: {
-              type: "object",
-              properties: {
-                paymentCount: { type: "integer" },
-                totalXLM: { type: "string" },
-                counterparties: { $ref: "#/components/schemas/CohortCounterpartySummary" },
-              },
-            },
-            totalCounterparties: { type: "integer" },
-            repeatRate: { type: "integer" },
+            networkPassphrase: { type: "string" },
           },
         },
-        CohortBreakdown: {
+        TxFunctionDeployment: {
           type: "object",
           properties: {
-            publicKey: { type: "string" },
-            period: { type: "string", enum: ["month", "week"] },
-            periods: { type: "integer" },
-            range: {
-              type: "object",
-              properties: {
-                start: { type: "string", format: "date-time", nullable: true },
-                end: { type: "string", format: "date-time", nullable: true },
-              },
-            },
-            cohorts: {
-              type: "array",
-              items: { $ref: "#/components/schemas/CohortPeriod" },
-            },
-          },
-        },
-        PaymentStreamEvent: {
-          type: "object",
-          properties: {
-            id: { type: "string" },
-            type: { type: "string", enum: ["sent", "received"] },
-            amount: { type: "string" },
-            asset: { type: "string" },
-            from: { type: "string" },
-            to: { type: "string" },
-            memo: { type: "string", nullable: true },
+            id: { type: "string", format: "uuid" },
+            ownerPublicKey: { type: "string" },
+            type: { type: "string", enum: ["dca", "stop_loss"] },
+            status: { type: "string", enum: ["active", "paused"] },
+            config: { type: "object" },
+            deploymentHash: { type: "string" },
+            signedChallengeXDR: { type: "string" },
             createdAt: { type: "string", format: "date-time" },
-            transactionHash: { type: "string" },
-            pagingToken: { type: "string" },
+            nextRunAt: {
+              type: "string",
+              format: "date-time",
+              nullable: true,
+            },
+            lastExecutedAt: {
+              type: "string",
+              format: "date-time",
+              nullable: true,
+            },
+            lastCheckedAt: {
+              type: "string",
+              format: "date-time",
+              nullable: true,
+            },
+            lastObservedPriceUsd: {
+              type: "number",
+              nullable: true,
+            },
+            lastError: {
+              type: "string",
+              nullable: true,
+            },
+          },
+        },
+        ExecutionLogEntry: {
+          type: "object",
+          properties: {
+            id: { type: "string", format: "uuid" },
+            deploymentId: { type: "string", format: "uuid" },
+            status: { type: "string", example: "executed" },
+            message: { type: "string" },
+            result: { type: "object", nullable: true },
+            createdAt: { type: "string", format: "date-time" },
           },
         },
         AccountBalance: {
@@ -201,6 +194,31 @@ const options = {
             subentryCount: { type: "integer" },
           },
         },
+        AssetTrustline: {
+          type: "object",
+          properties: {
+            assetCode: { type: "string", description: "Asset code (e.g. USDC)" },
+            assetIssuer: { type: "string", description: "Issuing account public key" },
+            balance: { type: "string", description: "Held balance" },
+            limit: { type: "string", description: "Trustline limit" },
+          },
+        },
+        StreamStatus: {
+          type: "object",
+          properties: {
+            payer: { type: "string", description: "Payer Stellar address (contract Address)" },
+            recipient: {
+              type: "string",
+              nullable: true,
+              description: "First recipient address, or null when the stream has none",
+            },
+            ratePerLedger: { type: "string", description: "Tokens accrued per ledger (i128 as string)" },
+            deposited: { type: "string", description: "Total deposited into the stream (i128 as string)" },
+            claimed: { type: "string", description: "Total claimed by all recipients so far (i128 as string)" },
+            startLedger: { type: "integer", description: "Ledger the stream started at" },
+            claimableNow: { type: "string", description: "Derived unclaimed amount as of the latest ledger (i128 as string)" },
+          },
+        },
         Tip: {
           type: "object",
           properties: {
@@ -221,156 +239,13 @@ const options = {
             averageAmount: { type: "string" },
           },
         },
-        TxFunctionChallengeRequest: {
-          type: "object",
-          required: ["ownerPublicKey", "type", "config"],
-          properties: {
-            ownerPublicKey: {
-              type: "string",
-              pattern: "^G[A-Z0-9]{55}$",
-              description: "Stellar public key of the txFunction owner",
-            },
-            type: {
-              type: "string",
-              enum: ["dca", "stop_loss", "escrow_release"],
-              description: "Type of automated txFunction",
-            },
-            config: {
-              type: "object",
-              description: "Type-specific configuration — see DcaConfig, StopLossConfig, or EscrowReleaseConfig",
-            },
-          },
-        },
-        TxFunctionChallengeResponse: {
-          type: "object",
-          properties: {
-            challengeXDR: {
-              type: "string",
-              description: "Base64-encoded ManageData transaction XDR the owner must sign",
-            },
-            deploymentHash: {
-              type: "string",
-              description: "SHA-256 hash of the normalised config, included in the challenge",
-            },
-            normalizedConfig: { type: "object" },
-            networkPassphrase: { type: "string" },
-          },
-        },
-        TxFunctionDeployRequest: {
-          type: "object",
-          required: ["ownerPublicKey", "type", "config", "deploymentHash", "signedChallengeXDR"],
-          properties: {
-            ownerPublicKey: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            type: { type: "string", enum: ["dca", "stop_loss", "escrow_release"] },
-            config: { type: "object" },
-            deploymentHash: { type: "string" },
-            signedChallengeXDR: {
-              type: "string",
-              description: "The challenge XDR signed by the owner's Freighter (or Ledger) wallet",
-            },
-          },
-        },
-        TxFunctionDeployment: {
-          type: "object",
-          properties: {
-            id: { type: "string", format: "uuid" },
-            ownerPublicKey: { type: "string" },
-            type: { type: "string", enum: ["dca", "stop_loss", "escrow_release"] },
-            status: { type: "string", enum: ["active", "paused", "completed"] },
-            config: { type: "object" },
-            deploymentHash: { type: "string" },
-            createdAt: { type: "string", format: "date-time" },
-            nextRunAt: { type: "string", format: "date-time", nullable: true },
-            lastExecutedAt: { type: "string", format: "date-time", nullable: true },
-            lastCheckedAt: { type: "string", format: "date-time", nullable: true },
-            lastObservedPriceUsd: { type: "number", nullable: true },
-            lastError: { type: "string", nullable: true },
-          },
-        },
-        ExecutionLogEntry: {
-          type: "object",
-          properties: {
-            id: { type: "string", format: "uuid" },
-            deploymentId: { type: "string", format: "uuid" },
-            status: {
-              type: "string",
-              enum: ["created", "executed", "error", "status"],
-              description: "Execution event type",
-            },
-            message: { type: "string" },
-            result: {
-              type: "object",
-              nullable: true,
-              description: "Operation intent generated by the txFunction evaluator",
-            },
-            createdAt: { type: "string", format: "date-time" },
-          },
-        },
         Webhook: {
           type: "object",
           properties: {
-            id: { type: "string" },
-            publicKey: { type: "string", description: "Stellar public key being monitored" },
-            url: { type: "string", description: "Destination URL for POST notifications" },
-            createdAt: { type: "string", format: "date-time" },
-          },
-        },
-        WebhookCreateRequest: {
-          type: "object",
-          required: ["publicKey", "url", "secret"],
-          properties: {
-            publicKey: {
-              type: "string",
-              pattern: "^G[A-Z0-9]{55}$",
-              description: "Stellar public key to monitor",
-            },
-            url: {
-              type: "string",
-              format: "uri",
-              description: "HTTPS URL to receive webhook notifications",
-            },
-            secret: {
-              type: "string",
-              minLength: 32,
-              description: "HMAC signing secret (min 32 chars)",
-            },
-          },
-        },
-        WebhookRegistrationResponse: {
-          type: "object",
-          properties: {
-            success: { type: "boolean", example: true },
-            webhook: { $ref: "#/components/schemas/Webhook" },
-          },
-        },
-        WebhookListResponse: {
-          type: "object",
-          properties: {
-            webhooks: {
-              type: "array",
-              items: { $ref: "#/components/schemas/Webhook" },
-            },
-          },
-        },
-        ExportSchedule: {
-          type: "object",
-          properties: {
+            id: { type: "string", format: "uuid" },
+            url: { type: "string", format: "uri" },
             publicKey: { type: "string" },
-            email: { type: "string", format: "email" },
-            frequency: { type: "string", enum: ["daily", "weekly", "monthly"] },
-            nextRunAt: { type: "string", format: "date-time" },
             createdAt: { type: "string", format: "date-time" },
-          },
-        },
-        ExportScheduleRequest: {
-          type: "object",
-          required: ["email", "frequency"],
-          properties: {
-            email: { type: "string", format: "email" },
-            frequency: {
-              type: "string",
-              enum: ["daily", "weekly", "monthly"],
-            },
           },
         },
       },
@@ -481,11 +356,6 @@ const options = {
           responses: {
             200: {
               description: "Account info",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 100 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
               content: {
                 "application/json": {
                   schema: {
@@ -499,7 +369,6 @@ const options = {
               },
             },
             404: { description: "Account not found" },
-            429: { description: "Rate limit exceeded — back off and retry after RateLimit-Reset seconds" },
           },
         },
       },
@@ -538,7 +407,48 @@ const options = {
           },
         },
       },
+      "/api/accounts/{publicKey}/assets": {
+        get: {
+          tags: ["Accounts"],
+          summary: "List non-native asset trustlines",
+          description:
+            "Returns every non-native balance the account holds a trustline for. " +
+            "Native XLM is excluded — use `/api/accounts/{publicKey}` for full balances. " +
+            "Requires a SEP-0010 JWT.",
+          parameters: [
+            {
+              name: "publicKey",
+              in: "path",
+              required: true,
+              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
+            },
+          ],
+          responses: {
+            200: {
+              description: "Non-native asset trustlines",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      success: { type: "boolean" },
+                      data: {
+                        type: "array",
+                        items: { $ref: "#/components/schemas/AssetTrustline" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            401: { description: "Missing, invalid, or expired JWT" },
+            404: { description: "Account not found" },
+            429: { description: "Rate limit exceeded" },
+          },
+        },
+      },
       "/api/accounts/resolve/{username}": {
+
         get: {
           tags: ["Accounts"],
           summary: "Resolve a username to a Stellar public key",
@@ -630,11 +540,6 @@ const options = {
           responses: {
             200: {
               description: "Payment history",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 100 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
               content: {
                 "application/json": {
                   schema: {
@@ -650,6 +555,45 @@ const options = {
                 },
               },
             },
+          },
+        },
+      },
+      "/api/payments/stream-status/{streamId}": {
+        get: {
+          tags: ["Payments"],
+          summary: "Get streaming payment channel state from the Soroban contract",
+          description:
+            "Reads the `Stream` entry from the deployed MicroPay contract's persistent storage " +
+            "via Soroban RPC `getContractData` and returns its current state. The contract ID is " +
+            "configured with the `CONTRACT_ID` environment variable. `claimableNow` mirrors the " +
+            "contract's accrual logic (paused ledgers excluded, capped at the funded window).",
+          parameters: [
+            {
+              name: "streamId",
+              in: "path",
+              required: true,
+              schema: { type: "integer", minimum: 0, maximum: 4294967295 },
+              description: "u32 stream id stored in the contract",
+            },
+          ],
+          responses: {
+            200: {
+              description: "Current stream state",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      success: { type: "boolean" },
+                      data: { $ref: "#/components/schemas/StreamStatus" },
+                    },
+                  },
+                },
+              },
+            },
+            400: { description: "streamId is not an unsigned 32-bit integer" },
+            404: { description: "Stream not found in contract storage" },
+            503: { description: "CONTRACT_ID not configured or Soroban RPC unavailable" },
             429: { description: "Rate limit exceeded" },
           },
         },
@@ -678,172 +622,6 @@ const options = {
                       data: { $ref: "#/components/schemas/PaymentStats" },
                     },
                   },
-                },
-              },
-            },
-          },
-        },
-      },
-      "/api/analytics/{publicKey}/summary": {
-        get: {
-          tags: ["Analytics"],
-          summary: "Get payment summary for an account",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Analytics summary",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      data: { $ref: "#/components/schemas/AnalyticsSummary" },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      "/api/analytics/{publicKey}/top-recipients": {
-        get: {
-          tags: ["Analytics"],
-          summary: "Get top payment recipients",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Top recipients",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      data: {
-                        type: "array",
-                        items: {
-                          $ref: "#/components/schemas/TopRecipient",
-                        },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      "/api/analytics/{publicKey}/activity": {
-        get: {
-          tags: ["Analytics"],
-          summary: "Get payment activity by day",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Activity data",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      data: {
-                        type: "array",
-                        items: { $ref: "#/components/schemas/ActivityDay" },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      "/api/analytics/{publicKey}/cohorts": {
-        get: {
-          tags: ["Analytics"],
-          summary: "Get repeat-vs-one-time counterparty cohorts",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-            {
-              name: "period",
-              in: "query",
-              required: false,
-              schema: { type: "string", enum: ["month", "week"] },
-              description: "Bucket size for the cohort breakdown. Defaults to month.",
-            },
-            {
-              name: "periods",
-              in: "query",
-              required: false,
-              schema: { type: "integer", minimum: 1, maximum: 12 },
-              description: "How many buckets to include. Defaults to 6.",
-            },
-          ],
-          responses: {
-            200: {
-              description: "Cohort breakdown",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      data: { $ref: "#/components/schemas/CohortBreakdown" },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      "/api/analytics/{publicKey}/stream": {
-        get: {
-          tags: ["Analytics"],
-          summary: "Stream new payment events as server-sent events",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "text/event-stream with payment events",
-              content: {
-                "text/event-stream": {
-                  schema: { $ref: "#/components/schemas/PaymentStreamEvent" },
                 },
               },
             },
@@ -974,615 +752,99 @@ const options = {
           },
         },
       },
-      "/api/turrets": {
+      "/api/tips/leaderboard": {
         get: {
-          tags: ["Turrets"],
-          summary: "List txFunction deployments",
-          description: "Returns all deployments. Filter by owner using `ownerPublicKey` query parameter.",
-          parameters: [
-            {
-              name: "ownerPublicKey",
-              in: "query",
-              required: false,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-              description: "Filter deployments by owner Stellar public key",
-            },
-          ],
-          responses: {
-            200: {
-              description: "Array of deployments",
-              headers: {
-                "RateLimit-Limit": {
-                  description: "Maximum requests allowed in the current window (20 per minute)",
-                  schema: { type: "integer", example: 20 },
-                },
-                "RateLimit-Remaining": {
-                  description: "Requests remaining in the current window",
-                  schema: { type: "integer", example: 19 },
-                },
-                "RateLimit-Reset": {
-                  description: "Seconds until the rate-limit window resets",
-                  schema: { type: "integer", example: 45 },
-                },
-              },
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean", example: true },
-                      data: {
-                        type: "array",
-                        items: { $ref: "#/components/schemas/TxFunctionDeployment" },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-            429: {
-              description: "Rate limit exceeded",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer" } },
-                "RateLimit-Remaining": { schema: { type: "integer", example: 0 } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
-            },
-          },
+          tags: ["Tips"],
+          summary: "Get the top XLM tip senders and recipients",
+          description:
+            "Accounts that opted out via PUT /api/tips/leaderboard/opt-out are excluded from the rankings. Totals still include their tips.",
+          responses: { 200: { description: "Community tip leaderboard" } },
         },
       },
-      "/api/turrets/challenge": {
-        post: {
-          tags: ["Turrets"],
-          summary: "Create a txFunction signing challenge",
-          description: "Returns a ManageData transaction XDR that the user must sign with their Stellar keypair to prove ownership. The signed XDR is then passed to `POST /api/turrets/deploy`.",
+      "/api/tips/leaderboard/opt-out": {
+        get: {
+          tags: ["Tips"],
+          summary: "Get whether the authenticated account is hidden from leaderboards",
+          security: [{ bearerAuth: [] }],
+          responses: {
+            200: { description: "Current opt-out state" },
+            401: { description: "Missing or invalid JWT" },
+            429: { description: "Rate limit exceeded" },
+          },
+        },
+        put: {
+          tags: ["Tips"],
+          summary: "Opt the authenticated account in or out of public leaderboards",
+          security: [{ bearerAuth: [] }],
           requestBody: {
             required: true,
-            content: {
-              "application/json": {
-                schema: { $ref: "#/components/schemas/TxFunctionChallengeRequest" },
-              },
-            },
-          },
-          responses: {
-            200: {
-              description: "Challenge XDR and deployment hash",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 20 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean", example: true },
-                      data: { $ref: "#/components/schemas/TxFunctionChallengeResponse" },
-                    },
-                  },
-                },
-              },
-            },
-            400: { description: "Invalid request body (bad public key, unknown type, invalid config)" },
-            429: { description: "Rate limit exceeded" },
-          },
-        },
-      },
-      "/api/turrets/deploy": {
-        post: {
-          tags: ["Turrets"],
-          summary: "Deploy a signed txFunction",
-          description: "Verifies the signed challenge and registers the txFunction. The runner begins evaluating the deployment immediately.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: { $ref: "#/components/schemas/TxFunctionDeployRequest" },
-              },
-            },
-          },
-          responses: {
-            201: {
-              description: "Deployment created",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 20 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean", example: true },
-                      data: { $ref: "#/components/schemas/TxFunctionDeployment" },
-                    },
-                  },
-                },
-              },
-            },
-            400: { description: "Config hash mismatch or invalid asset" },
-            401: { description: "Signed challenge was not signed by the owner" },
-            429: { description: "Rate limit exceeded" },
-          },
-        },
-      },
-      "/api/turrets/{id}": {
-        get: {
-          tags: ["Turrets"],
-          summary: "Get a single txFunction deployment",
-          parameters: [
-            {
-              name: "id",
-              in: "path",
-              required: true,
-              schema: { type: "string", format: "uuid" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Deployment details",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 20 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean", example: true },
-                      data: { $ref: "#/components/schemas/TxFunctionDeployment" },
-                    },
-                  },
-                },
-              },
-            },
-            404: { description: "Deployment not found" },
-            429: { description: "Rate limit exceeded" },
-          },
-        },
-      },
-      "/api/turrets/{id}/history": {
-        get: {
-          tags: ["Turrets"],
-          summary: "Get execution history for a deployment",
-          parameters: [
-            {
-              name: "id",
-              in: "path",
-              required: true,
-              schema: { type: "string", format: "uuid" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Execution log entries (most recent first)",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 20 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean", example: true },
-                      data: {
-                        type: "array",
-                        items: { $ref: "#/components/schemas/ExecutionLogEntry" },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-            404: { description: "Deployment not found" },
-            429: { description: "Rate limit exceeded" },
-          },
-        },
-      },
-      "/api/turrets/{id}/pause": {
-        post: {
-          tags: ["Turrets"],
-          summary: "Pause a txFunction deployment",
-          parameters: [
-            {
-              name: "id",
-              in: "path",
-              required: true,
-              schema: { type: "string", format: "uuid" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Updated deployment with status 'paused'",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 20 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
-            },
-            404: { description: "Deployment not found" },
-            429: { description: "Rate limit exceeded" },
-          },
-        },
-      },
-      "/api/turrets/{id}/resume": {
-        post: {
-          tags: ["Turrets"],
-          summary: "Resume a paused txFunction deployment",
-          parameters: [
-            {
-              name: "id",
-              in: "path",
-              required: true,
-              schema: { type: "string", format: "uuid" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Updated deployment with status 'active'",
-              headers: {
-                "RateLimit-Limit": { schema: { type: "integer", example: 20 } },
-                "RateLimit-Remaining": { schema: { type: "integer" } },
-                "RateLimit-Reset": { schema: { type: "integer" } },
-              },
-            },
-            404: { description: "Deployment not found" },
-            429: { description: "Rate limit exceeded" },
-          },
-        },
-      },
-      "/api/auth/refresh": {
-        post: {
-          tags: ["Authentication"],
-          summary: "Refresh an expired access token within the grace window",
-          requestBody: {
-            required: false,
             content: {
               "application/json": {
                 schema: {
                   type: "object",
-                  properties: {
-                    token: { type: "string", description: "Current JWT token" },
-                  },
+                  required: ["optOut"],
+                  properties: { optOut: { type: "boolean" } },
                 },
               },
             },
           },
           responses: {
-            200: {
-              description: "New JWT token",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      token: { type: "string" },
-                    },
-                  },
-                },
-              },
-            },
-            401: { description: "Token invalid or expired beyond grace window" },
-          },
-        },
-      },
-      "/api/auth/logout-all": {
-        post: {
-          tags: ["Authentication"],
-          summary: "Revoke every active refresh-token family for the authenticated user (log out of all devices)",
-          responses: {
-            200: {
-              description: "All sessions revoked",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      revokedFamilies: {
-                        type: "integer",
-                        description: "Number of token families revoked",
-                      },
-                    },
-                  },
-                },
-              },
-            },
-            401: { description: "Unauthorized: missing or invalid token" },
-          },
-        },
-      },
-      "/api/analytics/{publicKey}/export-schedule": {
-        get: {
-          tags: ["Analytics"],
-          summary: "Get scheduled export configuration",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Export schedule",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      data: { $ref: "#/components/schemas/ExportSchedule" },
-                    },
-                  },
-                },
-              },
-            },
-            404: { description: "No export schedule found" },
-          },
-        },
-        post: {
-          tags: ["Analytics"],
-          summary: "Set up recurring email export",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: { $ref: "#/components/schemas/ExportScheduleRequest" },
-              },
-            },
-          },
-          responses: {
-            200: {
-              description: "Export scheduled",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      data: { $ref: "#/components/schemas/ExportSchedule" },
-                    },
-                  },
-                },
-              },
-            },
-            400: { description: "Invalid request body" },
-          },
-        },
-      },
-      "/api/analytics/{publicKey}/export-trigger": {
-        post: {
-          tags: ["Analytics"],
-          summary: "Manually trigger sending export email",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Export triggered",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      message: { type: "string" },
-                    },
-                  },
-                },
-              },
-            },
-            404: { description: "No export schedule found" },
-          },
-        },
-      },
-      "/api/tips/leaderboard/{creatorPublicKey}": {
-        get: {
-          tags: ["Tips"],
-          summary: "Get top tippers for a creator",
-          parameters: [
-            {
-              name: "creatorPublicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "Top tippers",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean" },
-                      data: {
-                        type: "array",
-                        items: {
-                          type: "object",
-                          properties: {
-                            publicKey: { type: "string" },
-                            totalAmount: { type: "string" },
-                            count: { type: "integer" },
-                          },
-                        },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      "/api/webhooks": {
-        post: {
-          tags: ["Webhooks"],
-          summary: "Register a new webhook",
-          description: "Register a webhook to receive notifications when payments occur for a specific Stellar public key.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: { $ref: "#/components/schemas/WebhookCreateRequest" },
-              },
-            },
-          },
-          responses: {
-            201: {
-              description: "Webhook registered",
-              content: {
-                "application/json": {
-                  schema: { $ref: "#/components/schemas/WebhookRegistrationResponse" },
-                },
-              },
-            },
-            400: { description: "Invalid request body" },
+            200: { description: "Updated opt-out state, persisted before responding" },
+            400: { description: "optOut is not a boolean" },
+            401: { description: "Missing or invalid JWT" },
             429: { description: "Rate limit exceeded" },
           },
         },
       },
-      "/api/webhooks/{publicKey}": {
-        get: {
+      "/api/webhooks/register": {
+        post: {
           tags: ["Webhooks"],
-          summary: "List webhooks for an account",
-          parameters: [
-            {
-              name: "publicKey",
-              in: "path",
-              required: true,
-              schema: { type: "string", pattern: "^G[A-Z0-9]{55}$" },
-            },
-          ],
-          responses: {
-            200: {
-              description: "List of webhooks (secrets stripped)",
-              content: {
-                "application/json": {
-                  schema: { $ref: "#/components/schemas/WebhookListResponse" },
-                },
-              },
-            },
-            429: { description: "Rate limit exceeded" },
+          summary: "Register a payment-event webhook",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              required: ["url", "publicKey", "secret"],
+              properties: { url: { type: "string", format: "uri" }, publicKey: { type: "string" }, secret: { type: "string", format: "password" } },
+            } } },
           },
+          responses: { 201: { description: "Webhook registered", content: { "application/json": { schema: { $ref: "#/components/schemas/SuccessResponse" } } } }, 400: { description: "Invalid registration payload" } },
         },
       },
       "/api/webhooks/{id}": {
         delete: {
           tags: ["Webhooks"],
-          summary: "Delete a webhook",
+          summary: "Deregister a webhook",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string", format: "uuid" } }],
+          responses: { 204: { description: "Webhook removed" }, 404: { description: "Webhook not found" } },
+        },
+      },
+      "/api/events/stream": {
+        get: {
+          tags: ["Events"],
+          summary: "Stream Soroban contract events (Server-Sent Events)",
+          description:
+            "Opens a `text/event-stream` connection. Each message is a JSON envelope with a `kind` of `ready`, `event` or `status`.",
           parameters: [
             {
-              name: "id",
-              in: "path",
-              required: true,
+              name: "cursor",
+              in: "query",
+              required: false,
               schema: { type: "string" },
+              description: "Resume from a paging cursor returned by Soroban RPC",
             },
           ],
           responses: {
             200: {
-              description: "Webhook deleted",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      success: { type: "boolean", example: true },
-                    },
-                  },
-                },
-              },
+              description: "Event stream",
+              content: { "text/event-stream": { schema: { type: "string" } } },
             },
-            404: { description: "Webhook not found" },
-            429: { description: "Rate limit exceeded" },
-          },
-        },
-      },
-      "/.well-known/stellar.toml": {
-        get: {
-          tags: ["Federation"],
-          summary: "SEP-0001 Stellar TOML discovery document",
-          responses: {
-            200: {
-              description: "TOML document containing the federation server URL",
-              content: {
-                "application/toml": {
-                  schema: {
-                    type: "string",
-                    example: 'FEDERATION_SERVER="https://stellarmicropay.io/federation"',
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-      "/federation": {
-        get: {
-          tags: ["Federation"],
-          summary: "SEP-0002 federation endpoint",
-          parameters: [
-            {
-              name: "q",
-              in: "query",
-              required: true,
-              schema: { type: "string" },
-              description: "Federation query. Use user*domain for type=name or a public key for type=id.",
-            },
-            {
-              name: "type",
-              in: "query",
-              required: true,
-              schema: { type: "string", enum: ["name", "id"] },
-              description: "Query type",
-            },
-          ],
-          responses: {
-            200: {
-              description: "Federation record",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      stellar_address: { type: "string", example: "alice*stellarmicropay.io" },
-                      account_id: { type: "string", example: "GABC...XYZ" },
-                    },
-                  },
-                },
-              },
-            },
-            400: { description: "Missing or invalid federation query" },
-            404: { description: "Federation record not found" },
           },
         },
       },
     },
   },
-  apis: [],
+  apis: [routesGlob],
 };
 
 module.exports = swaggerJsdoc(options);

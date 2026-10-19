@@ -25,39 +25,43 @@ export interface URIParseResult {
   isExternal?: boolean; // Whether this came from an external URI handler
 }
 
+/** Build a SEP-0007 payment URI from the required destination and optional fields. */
+export function buildSep0007Uri(input: {
+  destination: string;
+  amount?: string;
+  memo?: string;
+  assetCode?: string;
+  assetIssuer?: string;
+}): string {
+  const params = new URLSearchParams({ destination: input.destination });
+  if (input.amount) params.set('amount', input.amount);
+  if (input.memo) params.set('memo', input.memo);
+  if (input.assetCode) params.set('asset_code', input.assetCode);
+  if (input.assetIssuer) params.set('asset_issuer', input.assetIssuer);
+  return `stellar:pay?${params.toString()}`;
+}
+
 /**
  * Parse a SEP-0007 URI string
  * Supports both stellar:pay and web+stellar:pay formats
  */
 export function parseStellarURI(uri: string): URIParseResult {
   try {
-    // Accept three forms:
-    //   1. stellar:pay?destination=…           (SEP-0007 canonical)
-    //   2. web+stellar:pay?destination=…       (SEP-0007 PWA-friendly)
-    //   3. stellarmicropay://pay?to=…&amount=… (issue #209 deep link)
-    //
-    // The third form uses `to=` as a shorthand for `destination=`; we
-    // rewrite it transparently so the rest of the parser stays SEP-0007
-    // shaped. Everything else (amount, memo, etc.) keeps the SEP-0007
-    // parameter names.
-    const stellarRegex = /^(?:web\+)?stellar:pay\?(.+)$/;
-    const microPayRegex = /^stellarmicropay:\/\/pay\?(.+)$/;
-    const stellarMatch = uri.match(stellarRegex);
-    const microPayMatch = uri.match(microPayRegex);
+    // Handle stellar:pay, web+stellar:pay, and the web+stellar://pay
+    // (double-slash) variant some wallets emit — the leading "//" after the
+    // scheme is not part of SEP-0007's own format, so it is stripped before
+    // matching rather than treated as a distinct URI shape.
+    const stellarRegex = /^(?:web\+)?stellar:\/{0,2}pay\?(.+)$/;
+    const match = uri.match(stellarRegex);
 
-    if (!stellarMatch && !microPayMatch) {
+    if (!match) {
       return {
         success: false,
-        error: 'Invalid Stellar URI format. Expected stellar:pay, web+stellar:pay, or stellarmicropay://pay'
+        error: 'Invalid Stellar URI format. Expected stellar:pay or web+stellar:pay'
       };
     }
 
-    let queryString = (stellarMatch ?? microPayMatch)![1];
-    if (microPayMatch) {
-      // Rewrite `to=` → `destination=` so URLSearchParams downstream
-      // doesn't need a second code path.
-      queryString = queryString.replace(/(^|&)to=/g, '$1destination=');
-    }
+    const queryString = match[1];
     const params = new URLSearchParams(queryString);
 
     // Extract required parameters
@@ -82,25 +86,9 @@ export function parseStellarURI(uri: string): URIParseResult {
     const assetCode = params.get('asset_code') || undefined;
     const assetIssuer = params.get('asset_issuer') || undefined;
     const memo = params.get('memo') || undefined;
-    const memoTypeRaw = params.get('memo_type');
-    const validMemoTypes = ['MEMO_TEXT', 'MEMO_ID', 'MEMO_HASH', 'MEMO_RETURN'] as const;
-    const memoType = memoTypeRaw && validMemoTypes.includes(memoTypeRaw as typeof validMemoTypes[number])
-      ? (memoTypeRaw as ParsedStellarURI['memoType'])
-      : undefined;
+    const memoType = params.get('memo_type') as any || undefined;
     const msg = params.get('msg') || undefined;
     const networkPassphrase = params.get('network_passphrase') || undefined;
-
-    if (networkPassphrase) {
-      if (
-        networkPassphrase !== 'Public Global Stellar Network ; September 2015' &&
-        networkPassphrase !== 'Test SDF Network ; September 2015'
-      ) {
-        return {
-          success: false,
-          error: 'Unsupported network passphrase'
-        };
-      }
-    }
     const originDomain = params.get('origin_domain') || undefined;
     const signature = params.get('signature') || undefined;
     const callback = params.get('callback') || undefined;
@@ -124,17 +112,11 @@ export function parseStellarURI(uri: string): URIParseResult {
       }
     }
 
-    // Validate asset issuer and asset code together
+    // Validate asset issuer if asset code is present but not XLM
     if (assetCode && assetCode !== 'XLM' && !assetIssuer) {
       return {
         success: false,
         error: 'asset_issuer is required when asset_code is not XLM'
-      };
-    }
-    if (assetIssuer && (!assetCode || assetCode === 'XLM')) {
-      return {
-        success: false,
-        error: 'asset_code is required and cannot be XLM when asset_issuer is provided'
       };
     }
 
@@ -155,7 +137,7 @@ export function parseStellarURI(uri: string): URIParseResult {
     return {
       success: true,
       data: result,
-      isExternal: uri.startsWith('web+stellar:')
+      isExternal: uri.startsWith('web+stellar:') || uri.startsWith('web+stellar://')
     };
   } catch (error) {
     return {
@@ -170,12 +152,12 @@ export function parseStellarURI(uri: string): URIParseResult {
  */
 export function getStellarURIFromURL(): URIParseResult | null {
   if (typeof window === 'undefined') return null;
-  
+
   const urlParams = new URLSearchParams(window.location.search);
   const stellarURI = urlParams.get('uri');
-  
+
   if (!stellarURI) return null;
-  
+
   return parseStellarURI(stellarURI);
 }
 
@@ -185,7 +167,7 @@ export function getStellarURIFromURL(): URIParseResult | null {
  */
 export function registerProtocolHandler(): void {
   if (typeof window === 'undefined') return;
-  
+
   try {
     // Register for web+stellar: protocol
     navigator.registerProtocolHandler('web+stellar', `${window.location.origin}?uri=%s`);
@@ -196,16 +178,34 @@ export function registerProtocolHandler(): void {
   }
 }
 
+export interface PrefillData {
+  destination: string;
+  amount: string;
+  memo: string;
+}
+
 /**
- * Convert parsed URI to prefill data for SendPaymentForm
+ * Convert parsed URI or URI string to prefill data for SendPaymentForm
  */
-export function uriToPrefillData(parsed: ParsedStellarURI) {
+export function uriToPrefillData(parsed: ParsedStellarURI): PrefillData;
+export function uriToPrefillData(uri: string): PrefillData | null;
+export function uriToPrefillData(input: ParsedStellarURI | string): PrefillData | null;
+export function uriToPrefillData(input: ParsedStellarURI | string): PrefillData | null {
+  if (typeof input === 'string') {
+    const parseResult = parseStellarURI(input);
+    if (!parseResult.success || !parseResult.data) {
+      return null;
+    }
+    return {
+      destination: parseResult.data.destination,
+      amount: parseResult.data.amount || '',
+      memo: parseResult.data.memo || ''
+    };
+  }
+
   return {
-    destination: parsed.destination,
-    amount: parsed.amount || '',
-    memo: parsed.memo || '',
-    assetCode: parsed.assetCode,
-    assetIssuer: parsed.assetIssuer,
-    networkPassphrase: parsed.networkPassphrase
+    destination: input.destination,
+    amount: input.amount || '',
+    memo: input.memo || ''
   };
 }

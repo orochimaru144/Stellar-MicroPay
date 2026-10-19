@@ -1,0 +1,409 @@
+/**
+ * pages/streams.tsx
+ * Soroban streaming payment contract UI.
+ * Allows users to open, view, claim, and close streaming payments.
+ */
+
+import { useState, useEffect, useCallback } from "react";
+import Head from "next/head";
+import { useWallet } from "@/lib/useWallet";
+import { useTranslation } from "@/contexts/I18nContext";
+import { signTransactionWithWallet } from "@/lib/wallet";
+import { useTranslation } from "@/contexts/I18nContext";
+import { formatXLM } from "@/utils/intlFormatters";
+import { buildPaymentTransaction, submitTransaction, getXLMBalance, STELLAR_MINIMUM_ACCOUNT_BALANCE_XLM } from "@/lib/stellar";
+
+interface Stream {
+  streamId: string;
+  payer: string;
+  recipient: string;
+  ratePerHour: string; // XLM per hour
+  deposit: string; // Total XLM deposited
+  claimable: string; // XLM available to claim
+  startTime: string;
+  isActive: boolean;
+}
+
+interface NewStreamForm {
+  recipient: string;
+  ratePerHour: string; // XLM per hour
+  deposit: string; // Total XLM to deposit
+}
+
+export default function StreamsPage() {
+  const { publicKey } = useWallet();
+  const { t } = useTranslation();
+  const [xlmBalance, setXlmBalance] = useState("0");
+  const [activeTab, setActiveTab] = useState<"open" | "my-streams" | "received">("open");
+  const [myStreams, setMyStreams] = useState<Stream[]>([]);
+  const [receivedStreams, setReceivedStreams] = useState<Stream[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  
+  // New stream form
+  const [newStream, setNewStream] = useState<NewStreamForm>({
+    recipient: "",
+    ratePerHour: "",
+    deposit: "",
+  });
+
+  // Load streams and wallet balance on mount
+  const loadStreams = useCallback(async () => {
+    if (!publicKey) return;
+    setLoading(true);
+    setError(null);
+    try {
+      // In production, this would fetch from the backend
+      // For now, using mock data
+      setMyStreams([]);
+      setReceivedStreams([]);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t("streams.failedToLoad"));
+    } finally {
+      setLoading(false);
+    }
+  }, [publicKey, t]);
+
+  // Load streams on mount
+  useEffect(() => {
+    void loadStreams();
+  }, [loadStreams]);
+
+  // Keep the native XLM balance in sync so the deposit guard below stays accurate.
+  useEffect(() => {
+    let isActive = true;
+
+    if (!publicKey) {
+      setXlmBalance("0");
+      return;
+    }
+
+    getXLMBalance(publicKey)
+      .then((balance) => {
+        if (isActive) setXlmBalance(balance);
+      })
+      .catch(() => {
+        if (isActive) setXlmBalance("0");
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [publicKey]);
+
+  const handleOpenStream = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!publicKey) return;
+
+    const ratePerHourNum = parseFloat(newStream.ratePerHour);
+    const depositNum = parseFloat(newStream.deposit);
+
+    if (!newStream.recipient || !ratePerHourNum || !depositNum) {
+      setError(t("streams.fillAllFields"));
+      return;
+    }
+
+    if (depositNum < ratePerHourNum) {
+      setError(t("streams.depositMinimum"));
+      return;
+    }
+
+    const availableBalance = parseFloat(xlmBalance) - STELLAR_MINIMUM_ACCOUNT_BALANCE_XLM;
+    if (depositNum > availableBalance) {
+      setError(t("streams.insufficientBalance"));
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      // In production, this would build a Soroban transaction to create the stream
+      // For now, we'll simulate with a regular payment
+      const tx = await buildPaymentTransaction({
+        fromPublicKey: publicKey,
+        toPublicKey: newStream.recipient,
+        amount: newStream.deposit,
+        memo: `Stream: ${ratePerHourNum} XLM/hour`,
+      });
+
+      const { signedXDR, error: signError } = await signTransactionWithWallet(tx.toXDR());
+      if (signError || !signedXDR) throw new Error(signError || t("streams.signingFailed"));
+
+      await submitTransaction(signedXDR);
+
+      // Reset form
+      setNewStream({ recipient: "", ratePerHour: "", deposit: "" });
+      alert(t("streams.openedSuccess"));
+      loadStreams();
+    } catch (err: any) {
+      setError(err.message || t("streams.failedToOpen"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleClaim = async (streamId: string) => {
+    if (!publicKey) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      // In production, this would call claim_stream on the Soroban contract
+      alert(t("streams.claimedStream", { streamId }));
+      loadStreams();
+    } catch (err: any) {
+      setError(err.message || t("streams.failedToClaim"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleClose = async (streamId: string) => {
+    if (!publicKey) return;
+
+    if (!confirm(t("streams.closeConfirm"))) {
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      // In production, this would call close_stream on the Soroban contract
+      alert(t("streams.closedStream", { streamId }));
+      loadStreams();
+    } catch (err: any) {
+      setError(err.message || t("streams.failedToClose"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <>
+      <Head>
+        <title>{t("pages.streams.title")}</title>
+      </Head>
+      <div className="max-w-6xl mx-auto px-4 py-8">
+      <h1 className="font-display text-3xl font-bold text-white mb-2">Streaming Payments</h1>
+      <p className="text-slate-400 mb-8">Open, view, claim, and close Soroban streaming payment contracts.</p>
+
+      {error && (
+        <div className="mb-6 p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400">
+          {error}
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div className="flex gap-2 mb-6 border-b border-white/10 pb-4">
+        <button
+          onClick={() => setActiveTab("open")}
+          className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+            activeTab === "open"
+              ? "bg-stellar-500/20 text-stellar-300"
+              : "text-slate-400 hover:text-white hover:bg-white/5"
+          }`}
+        >
+          {t("streams.openStream")}
+        </button>
+        <button
+          onClick={() => setActiveTab("my-streams")}
+          className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+            activeTab === "my-streams"
+              ? "bg-stellar-500/20 text-stellar-300"
+              : "text-slate-400 hover:text-white hover:bg-white/5"
+          }`}
+        >
+          {t("streams.myStreams")}
+        </button>
+        <button
+          onClick={() => setActiveTab("received")}
+          className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+            activeTab === "received"
+              ? "bg-stellar-500/20 text-stellar-300"
+              : "text-slate-400 hover:text-white hover:bg-white/5"
+          }`}
+        >
+          {t("streams.receivedStreams")}
+        </button>
+      </div>
+
+      {/* Open Stream Tab */}
+      {activeTab === "open" && (
+        <div className="card max-w-2xl">
+          <h2 className="font-display text-xl font-semibold text-white mb-6">{t("streams.openNewStream")}</h2>
+          <form onSubmit={handleOpenStream} className="space-y-5">
+            <div>
+              <label className="label">{t("streams.recipientAddress")}</label>
+              <input
+                type="text"
+                value={newStream.recipient}
+                onChange={(e) => setNewStream({ ...newStream, recipient: e.target.value })}
+                placeholder="G..."
+                className="input-field font-mono"
+                disabled={loading}
+              />
+            </div>
+
+            <div>
+              <label className="label">{t("streams.rateHourly")}</label>
+              <input
+                type="number"
+                step="0.0000001"
+                min="0"
+                value={newStream.ratePerHour}
+                onChange={(e) => setNewStream({ ...newStream, ratePerHour: e.target.value })}
+                placeholder="10.0"
+                className="input-field"
+                disabled={loading}
+              />
+              <p className="mt-2 text-xs text-slate-500">
+                {t("streams.rateHint")}
+              </p>
+            </div>
+
+            <div>
+              <label className="label">{t("streams.depositAmount")}</label>
+              <input
+                type="number"
+                step="0.0000001"
+                min="0"
+                value={newStream.deposit}
+                onChange={(e) => setNewStream({ ...newStream, deposit: e.target.value })}
+                placeholder="100.0"
+                className="input-field"
+                disabled={loading}
+              />
+              <p className="mt-2 text-xs text-slate-500">
+                {t("streams.depositHint")}
+              </p>
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading || !publicKey}
+              className="btn-primary w-full"
+            >
+              {loading ? t("streams.openingStream") : t("streams.openStream")}
+            </button>
+          </form>
+        </div>
+      )}
+
+      {/* My Streams Tab */}
+      {activeTab === "my-streams" && (
+        <div className="card">
+          <h2 className="font-display text-xl font-semibold text-white mb-6">{t("streams.myStreamsPayer")}</h2>
+          {loading ? (
+            <div className="text-center text-slate-400 py-8">{t("streams.loading")}</div>
+          ) : myStreams.length === 0 ? (
+            <div className="text-center text-slate-400 py-8">{t("streams.noActiveStreams")}</div>
+          ) : (
+            <div className="space-y-4">
+              {myStreams.map((stream) => (
+                <div
+                  key={stream.streamId}
+                  className="rounded-xl border border-white/10 bg-white/5 p-4"
+                >
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <p className="text-sm text-slate-400">{t("streams.recipient")}</p>
+                      <p className="font-mono text-sm text-white">{stream.recipient}</p>
+                    </div>
+                    <span className={`px-2 py-1 rounded-full text-xs ${
+                      stream.isActive ? "bg-emerald-500/20 text-emerald-400" : "bg-slate-500/20 text-slate-400"
+                    }`}>
+                      {stream.isActive ? t("streams.active") : t("streams.closed")}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4 mb-4">
+                    <div>
+                      <p className="text-xs text-slate-500">{t("streams.rate")}</p>
+                      <p className="text-sm font-medium text-white">{formatXLM(stream.ratePerHour)}/hr</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-500">{t("streams.deposit")}</p>
+                      <p className="text-sm font-medium text-white">{formatXLM(stream.deposit)}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-500">{t("streams.claimable")}</p>
+                      <p className="text-sm font-medium text-stellar-300">{formatXLM(stream.claimable)}</p>
+                    </div>
+                  </div>
+                  {stream.isActive && (
+                    <button
+                      onClick={() => handleClose(stream.streamId)}
+                      disabled={loading}
+                      className="btn-secondary w-full text-sm"
+                    >
+                      {t("streams.closeStream")}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Received Streams Tab */}
+      {activeTab === "received" && (
+        <div className="card">
+          <h2 className="font-display text-xl font-semibold text-white mb-6">{t("streams.receivedStreams")}</h2>
+          {loading ? (
+            <div className="text-center text-slate-400 py-8">{t("streams.loading")}</div>
+          ) : receivedStreams.length === 0 ? (
+            <div className="text-center text-slate-400 py-8">{t("streams.noReceivedStreams")}</div>
+          ) : (
+            <div className="space-y-4">
+              {receivedStreams.map((stream) => (
+                <div
+                  key={stream.streamId}
+                  className="rounded-xl border border-white/10 bg-white/5 p-4"
+                >
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <p className="text-sm text-slate-400">{t("streams.payer")}</p>
+                      <p className="font-mono text-sm text-white">{stream.payer}</p>
+                    </div>
+                    <span className={`px-2 py-1 rounded-full text-xs ${
+                      stream.isActive ? "bg-emerald-500/20 text-emerald-400" : "bg-slate-500/20 text-slate-400"
+                    }`}>
+                      {stream.isActive ? t("streams.active") : t("streams.closed")}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4 mb-4">
+                    <div>
+                      <p className="text-xs text-slate-500">{t("streams.rate")}</p>
+                      <p className="text-sm font-medium text-white">{formatXLM(stream.ratePerHour)}/hr</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-500">{t("streams.totalDeposit")}</p>
+                      <p className="text-sm font-medium text-white">{formatXLM(stream.deposit)}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-500">{t("streams.claimable")}</p>
+                      <p className="text-sm font-medium text-stellar-300">{formatXLM(stream.claimable)}</p>
+                    </div>
+                  </div>
+                  {stream.isActive && (
+                    <button
+                      onClick={() => handleClaim(stream.streamId)}
+                      disabled={loading}
+                      className="btn-primary w-full text-sm"
+                    >
+                      {t("streams.claim", { amount: formatXLM(stream.claimable) })}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      </div>
+    </>
+  );
+}

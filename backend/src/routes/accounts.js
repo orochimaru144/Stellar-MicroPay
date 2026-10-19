@@ -6,49 +6,66 @@
 "use strict";
 
 const express = require("express");
-
 const router = express.Router();
+const { strictLimiter } = require("../middleware/rateLimit");
+const { validatePublicKey, sanitizeUsername, sanitizePublicKey } = require("../middleware/sanitization");
 const accountController = require("../controllers/accountController");
-const { verifyJWT } = require("../middleware/auth");
-const { strictLimiter, sensitiveLimiter } = require("../middleware/rateLimit");
-const { sanitizePublicKey, sanitizeUsername } = require("../middleware/sanitization");
-
-/**
- * Restrict account-data routes to the authenticated account holder (#278).
- * Runs after verifyJWT (which sets req.user.publicKey from the SEP-10 JWT).
- */
-function requireOwnAccount(req, res, next) {
-  if (req.user?.publicKey !== req.params.publicKey) {
-    return res
-      .status(403)
-      .json({ error: "Forbidden: you may only access your own account data" });
-  }
-  next();
-}
+const { horizonCircuitBreakerMiddleware } = require("../middleware/horizonCircuitBreaker");
 
 /**
  * GET /api/accounts/resolve/:username
  * Resolve a username to a Stellar public key.
  * Must be registered before /:publicKey or Express matches it as a key.
  */
-router.get("/resolve/:username", sensitiveLimiter, sanitizeUsername, accountController.resolveUsername);
+router.get("/resolve/:username", strictLimiter, sanitizeUsername, accountController.resolveUsername);
+
+/**
+ * GET /api/accounts/:publicKey/has-usdc-trustline
+ * Check whether an account has a USDC trustline.
+ * Must be registered before /:publicKey or Express matches it as a key.
+ */
+router.get(
+  "/:publicKey/has-usdc-trustline",
+  strictLimiter,
+  validatePublicKey(),
+  accountController.hasUSDCTrustline
+);
 
 /**
  * GET /api/accounts/:publicKey
  * Fetch account info and balances from Horizon.
  */
-router.get("/:publicKey", sensitiveLimiter, verifyJWT, sanitizePublicKey, requireOwnAccount, accountController.getAccount);
+router.get("/:publicKey", strictLimiter, validatePublicKey(), horizonCircuitBreakerMiddleware, accountController.getAccount);
 
 /**
  * GET /api/accounts/:publicKey/balance
  * Fetch just the XLM balance for an account.
  */
-router.get("/:publicKey/balance", sensitiveLimiter, verifyJWT, sanitizePublicKey, requireOwnAccount, accountController.getBalance);
+router.get("/:publicKey/balance", strictLimiter, validatePublicKey(), horizonCircuitBreakerMiddleware, accountController.getBalance);
+
+/**
+ * GET /api/accounts/:publicKey/streaks
+ * Fetch user's transaction streak.
+ */
+router.get("/:publicKey/streaks", strictLimiter, validatePublicKey(), accountController.getStreaks);
+
+/**
+ * GET /api/accounts/:publicKey/assets
+ * List all non-native asset trustlines (code, issuer, balance, limit) (#1065).
+ * Requires a valid SEP-0010 JWT.
+ */
+router.get("/:publicKey/assets", strictLimiter, verifyJWT, validatePublicKey(), accountController.getAccountAssets);
+
+/**
+ * GET /api/accounts/:publicKey/memo-history
+ * Fetch N most-recently used distinct memo texts for an account. JWT-protected.
+ */
+router.get("/:publicKey/memo-history", strictLimiter, verifyJWT, sanitizePublicKey, accountController.getMemoHistory);
 
 /**
  * POST /api/accounts/register
  * Register a new username with a public key.
  */
-router.post("/register", strictLimiter, verifyJWT, accountController.registerUsername);
+router.post("/register", strictLimiter, accountController.registerUsername);
 
 module.exports = router;

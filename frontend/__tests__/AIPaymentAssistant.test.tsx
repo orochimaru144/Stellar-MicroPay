@@ -6,19 +6,37 @@
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import AIPaymentAssistant from '../components/AIPaymentAssistant';
-import FloatingAssistantButton from '../components/FloatingAssistantButton';
-
-// Mock fetch for API calls
-global.fetch = jest.fn();
+import AIPaymentAssistant, { FloatingAssistantButton } from '../components/AIPaymentAssistant';
 
 const mockOnClose = jest.fn();
 const mockOnConfirm = jest.fn();
 
+// Builds a Response-like object for mocking the parse-payment API.
+const jsonResponse = (body: object, ok = true): Response =>
+  ({
+    ok,
+    json: async () => body,
+  }) as Response;
+
+// jsdom does not ship `fetch`; provide a stub so it can be spied on below.
+if (typeof global.fetch === 'undefined') {
+  Object.defineProperty(global, 'fetch', {
+    value: jest.fn(),
+    configurable: true,
+    writable: true,
+  });
+}
+
 describe('AIPaymentAssistant', () => {
+  let fetchSpy: jest.SpyInstance;
+
   beforeEach(() => {
     jest.clearAllMocks();
-    (fetch as jest.Mock).mockClear();
+    fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue(jsonResponse({}));
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
   });
 
   it('renders when open', () => {
@@ -70,10 +88,7 @@ describe('AIPaymentAssistant', () => {
       clarification: ''
     };
 
-    (fetch as jest.Mock).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockResponse
-    });
+    fetchSpy.mockResolvedValueOnce(jsonResponse(mockResponse));
 
     render(
       <AIPaymentAssistant
@@ -106,10 +121,7 @@ describe('AIPaymentAssistant', () => {
       clarification: 'What amount should be sent?'
     };
 
-    (fetch as jest.Mock).mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockResponse
-    });
+    fetchSpy.mockResolvedValueOnce(jsonResponse(mockResponse));
 
     render(
       <AIPaymentAssistant
@@ -130,12 +142,62 @@ describe('AIPaymentAssistant', () => {
       expect(screen.getByText('What amount should be sent?')).toBeInTheDocument();
     });
   });
+
+  it('submits the form, renders the parsed intent card and confirms the intent', async () => {
+    const intent = {
+      amount: '25 XLM',
+      recipient: 'GABC123',
+      memo: 'consultation',
+      isValid: true,
+      clarification: ''
+    };
+
+    fetchSpy.mockResolvedValueOnce(jsonResponse(intent));
+
+    render(
+      <AIPaymentAssistant
+        isOpen={true}
+        onClose={mockOnClose}
+        onConfirm={mockOnConfirm}
+      />
+    );
+
+    // Submit the form and verify the parse request hit the API.
+    const textarea = screen.getByPlaceholderText(/Send 50 XLM to GABC123/);
+    const submitButton = screen.getByText('Parse Payment');
+
+    fireEvent.change(textarea, { target: { value: 'Pay 25 XLM to GABC123 for the consultation' } });
+    fireEvent.click(submitButton);
+
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith(
+        '/api/parse-payment',
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({ 'Content-Type': 'application/json' })
+        })
+      );
+    });
+
+    // A parsed intent card renders with the returned amount, recipient and memo.
+    expect(await screen.findByText('Parsed Payment Details')).toBeInTheDocument();
+    expect(screen.getByText('25 XLM')).toBeInTheDocument();
+    expect(screen.getByText('GABC123')).toBeInTheDocument();
+    expect(screen.getByText('consultation')).toBeInTheDocument();
+
+    // Confirming forwards the exact parsed intent to onConfirm.
+    fireEvent.click(screen.getByText('Fill Payment Form'));
+
+    expect(mockOnConfirm).toHaveBeenCalledTimes(1);
+    expect(mockOnConfirm).toHaveBeenCalledWith(intent);
+    expect(mockOnClose).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('FloatingAssistantButton', () => {
   it('renders floating button', () => {
     const mockOnClick = jest.fn();
-    
+
     render(<FloatingAssistantButton onClick={mockOnClick} />);
 
     const button = screen.getByLabelText('Open AI Payment Assistant');
@@ -144,7 +206,7 @@ describe('FloatingAssistantButton', () => {
 
   it('calls onClick when button is clicked', () => {
     const mockOnClick = jest.fn();
-    
+
     render(<FloatingAssistantButton onClick={mockOnClick} />);
 
     const button = screen.getByLabelText('Open AI Payment Assistant');

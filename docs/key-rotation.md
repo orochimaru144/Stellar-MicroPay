@@ -1,282 +1,347 @@
-# Key Rotation Procedure
+# Backend Secret Rotation Guide
 
-This document describes the procedures for rotating cryptographic secrets (`JWT_SECRET` and `SERVER_PRIVATE_KEY`) in the Stellar MicroPay system without breaking active sessions and turret jobs.
+This guide explains how to safely rotate long-lived secrets used by the Stellar MicroPay backend without downtime or data loss. Each secret has different rotation consequences — understand them before rotating.
 
-## Overview
+---
 
-Stellar MicroPay uses two critical cryptographic secrets:
+## Overview of Secrets
 
-1. **`JWT_SECRET`**: Signs and verifies JWT tokens for SEP-10 authenticated sessions
-2. **`SERVER_PRIVATE_KEY`**: Signs SEP-10 challenge transactions for Stellar Web Authentication
+The backend holds three categories of long-lived secrets:
 
-Both secrets are defined in `backend/.env` and are critical for system security. Regular rotation is recommended as part of security best practices.
+| Secret | Used For | Impact on Active Sessions | Rollback Difficulty |
+| --- | --- | --- | --- |
+| `JWT_SECRET` | Signing authentication tokens | Sessions invalidated immediately | Easy (revert env var) |
+| `SERVER_PRIVATE_KEY` | SEP-10 challenge signing, federation identity | Challenge flow breaks; published via stellar.toml | Hard (clients must update config) |
+| `PAYMENT_SIGNING_SECRET` | HMAC request signing for replay protection | All in-flight signed requests fail | Hard (clients must be updated simultaneously) |
 
 ---
 
 ## JWT_SECRET Rotation
 
-### Purpose
+**Purpose**: Validates authentication tokens issued during login.
 
-`JWT_SECRET` is used to:
-- Sign JWT access tokens issued after SEP-10 authentication
-- Verify JWT tokens on protected API endpoints
-- Issue refreshed tokens via `/api/auth/refresh`
+**Impact**: Invalidates all active JWT sessions immediately. Clients must re-authenticate.
 
-### Current Behavior
+**Downtime**: None for the server, but users' sessions end and they are forced to log in again.
 
-- **Token TTL**: 24 hours
-- **Refresh Grace Window**: 7 days (tokens can be refreshed up to 7 days after expiry)
-- **Verification**: All tokens must be signed with the current `JWT_SECRET`
-- **Impact of Rotation**: Changing `JWT_SECRET` immediately invalidates all existing tokens
+### Procedure
 
-### Rotation Procedure
-
-#### Option 1: Graceful Rotation (Recommended)
-
-This approach allows existing sessions to continue while new sessions use the new secret.
-
-1. **Generate a new JWT secret**:
+1. **Generate a new secret**:
    ```bash
-   openssl rand -hex 32
+   openssl rand -base64 48
    ```
 
-2. **Add the new secret as `JWT_SECRET_NEW`** to `backend/.env`:
-   ```bash
-   JWT_SECRET=old_secret_value
-   JWT_SECRET_NEW=new_secret_value
-   ```
+2. **Plan the window**: Schedule rotation during low-traffic hours and notify users in advance (via in-app alert or email) that they may be logged out.
 
-3. **Update the authentication middleware** to support dual verification:
-   
-   Modify `backend/src/middleware/auth.js` to check both secrets during verification:
+3. **Update the environment variable**:
+   - Staging: Deploy and test first.
+   - Production: Set the new `JWT_SECRET` and redeploy.
+
+4. **Verification**:
+   - Old tokens are immediately invalid; new logins receive new tokens.
+   - Users on the site see a 401 error and are redirected to login.
+   - Monitor error logs for unexpected 401 spikes.
+
+### Rollback
+
+Revert `JWT_SECRET` to the previous value and redeploy. Old tokens become valid again within seconds.
+
+### Dual Secret Support (Zero-Session Loss)
+
+To rotate `JWT_SECRET` *without* invalidating active sessions:
+
+1. Store both the old and new secrets in environment (e.g., `JWT_SECRET_CURRENT` and `JWT_SECRET_PREVIOUS`).
+2. Update `backend/src/middleware/auth.js` to verify tokens against both secrets:
    ```javascript
-   const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
-   const JWT_SECRET_NEW = process.env.JWT_SECRET_NEW;
-   
-   function verifyJWT(req, res, next) {
-     const token = extractToken(req);
-     if (!token) {
-       return res.status(401).json({ error: "Unauthorized: missing or invalid token" });
-     }
-
-     try {
-       // Try verifying with new secret first
-       const decoded = jwt.verify(token, JWT_SECRET_NEW || JWT_SECRET, VERIFY_OPTIONS);
-       req.user = decoded;
-       return next();
-     } catch (err) {
-       // Fall back to old secret if new fails
-       try {
-         const decoded = jwt.verify(token, JWT_SECRET, VERIFY_OPTIONS);
-         req.user = decoded;
-         return next();
-       } catch (fallbackErr) {
-         if (fallbackErr.name === "TokenExpiredError") {
-           return res.status(401).json({ error: "Unauthorized: token expired", code: "token_expired" });
-         }
-         return res.status(401).json({ error: "Unauthorized: invalid token" });
-       }
-     }
-   }
+   const decoded = jwt.verify(token, JWT_SECRET_CURRENT)
+     .catch(() => jwt.verify(token, JWT_SECRET_PREVIOUS));
    ```
+3. Deploy the updated auth middleware with both secrets active.
+4. Wait for all old sessions to expire naturally (default: 24 hours per `expiresIn: "24h"` in `src/routes/auth.js`).
+5. Remove `JWT_SECRET_PREVIOUS` and redeploy.
 
-4. **Update token signing** to use the new secret:
-   
-   Modify `backend/src/routes/auth.js`:
-   ```javascript
-   const {
-     JWT_SECRET,
-     JWT_SECRET_NEW = JWT_SECRET, // Use new secret if available
-     SIGN_OPTIONS,
-     VERIFY_OPTIONS,
-     extractToken,
-   } = require("../middleware/auth");
-   
-   function issueToken(publicKey) {
-     return jwt.sign({ publicKey }, JWT_SECRET_NEW, SIGN_OPTIONS);
-   }
-   ```
-
-5. **Deploy the changes** and monitor for errors.
-
-6. **Wait for the refresh grace window** (7 days) to allow existing sessions to naturally expire or be refreshed.
-
-7. **Remove the old secret** from `backend/.env`:
-   ```bash
-   JWT_SECRET=new_secret_value
-   # Remove JWT_SECRET_NEW
-   ```
-
-8. **Revert the middleware changes** to use single-secret verification (remove the fallback logic).
-
-#### Option 2: Immediate Rotation (Forced Re-authentication)
-
-Use this method only if there's a security compromise or immediate rotation is required.
-
-1. **Generate a new JWT secret**:
-   ```bash
-   openssl rand -hex 32
-   ```
-
-2. **Replace `JWT_SECRET`** in `backend/.env`:
-   ```bash
-   JWT_SECRET=new_secret_value
-   ```
-
-3. **Restart the backend server**:
-   ```bash
-   # If using PM2
-   pm2 restart stellar-micropay-backend
-   
-   # If using Docker
-   docker-compose restart backend
-   ```
-
-4. **Impact**: All active sessions are immediately invalidated. Users must re-authenticate via SEP-10.
-
-### Impact on Active Sessions
-
-- **Immediate Rotation**: All active JWT tokens become invalid. Users receive 401 errors and must re-authenticate.
-- **Graceful Rotation**: Existing tokens remain valid until they expire (24 hours) or are refreshed (within 7 days). New tokens use the new secret.
-
-### Impact on Turret Jobs
-
-- **No Direct Impact**: Turret jobs are stored in-memory and don't depend on JWT tokens for execution.
-- **Indirect Impact**: API calls to manage turret jobs (deploy, pause, resume, list) require valid JWT authentication. After rotation, users must re-authenticate to manage jobs.
+This avoids forced re-authentication but requires code changes to the verifier before the rotation.
 
 ---
 
 ## SERVER_PRIVATE_KEY Rotation
 
-### Purpose
+**Purpose**: Generates SEP-10 challenge transactions and serves as the server's Stellar identity. Published as `SIGNING_KEY` in `stellar.toml`.
 
-`SERVER_PRIVATE_KEY` is used to:
-- Sign SEP-10 challenge transactions (`/api/auth`)
-- Verify signed challenges returned by clients
-- Prove server identity during SEP-10 authentication
+**Impact**: Challenge requests fail until clients update their config to the new public key. The server becomes unrecognizable to clients until `stellar.toml` is updated and propagated.
 
-### Current Behavior
+**Downtime**: Potential service disruption if clients' `stellar.toml` caches are stale or if clients hardcode the old public key.
 
-- **Caching**: The server keypair is cached at startup in `backend/src/routes/auth.js`
-- **Ephemeral Mode**: If `SERVER_PRIVATE_KEY` is unset, a random keypair is generated per cold start
-- **Impact of Rotation**: Changing `SERVER_PRIVATE_KEY` invalidates all pending challenge transactions
+### Procedure
 
-### Rotation Procedure
+1. **Generate a new Stellar keypair**:
+   ```bash
+   stellar keys generate --format json | jq '.public_key'
+   ```
+   or
+   ```bash
+   openssl rand -base64 32 | head -c 32 | base64 | xargs -I {} echo "SECRET_KEY: {}"
+   ```
+   (Use a proper Stellar key generator; do not use raw random bytes.)
 
-#### Step 1: Generate a New Stellar Keypair
+2. **Update stellar.toml**:
+   - Locate `.well-known/stellar.toml` on your web server.
+   - Update the `SIGNING_KEY` field to the new public key.
+   - Verify the old `SIGNING_KEY` is accessible during the transition (see step 5).
 
-```bash
-# Using Stellar SDK (if available in your environment)
-node -e "const {Keypair} = require('@stellar/stellar-sdk'); const kp = Keypair.random(); console.log('Public Key:', kp.publicKey()); console.log('Secret:', kp.secret());"
+3. **Deploy the new secret**:
+   - Set `SERVER_PRIVATE_KEY` in backend environment to the new private key.
+   - Do NOT restart the server yet.
 
-# Or use Freighter wallet to generate a new keypair
-```
+4. **Update DNS/HTTP cache**:
+   - Ensure `stellar.toml` is served with low `Cache-Control` TTL (e.g., `max-age=300`).
+   - Monitor DNS propagation for secondary federation domains if any.
 
-#### Step 2: Update Environment Variable
+5. **Restart the backend**:
+   - Restart the backend process to cache the new keypair (`getServerKeypair()` in `src/routes/auth.js`).
+   - Wait ~10 minutes for clients' `stellar.toml` caches to expire.
 
-Replace `SERVER_PRIVATE_KEY` in `backend/.env`:
-```bash
-SERVER_PRIVATE_KEY=S<your_new_secret_key>
-```
+6. **Verification**:
+   - New challenge requests are signed with the new key.
+   - Fetch `stellar.toml` and confirm the `SIGNING_KEY` matches the public key of the new private key.
+   - Test SEP-10 auth flow with a test wallet (e.g., Albedo, Freighter).
 
-#### Step 3: Restart the Backend Server
+### Rollback
 
-```bash
-# If using PM2
-pm2 restart stellar-micropay-backend
+If clients report authentication failures:
 
-# If using Docker
-docker-compose restart backend
-```
+1. Revert `SERVER_PRIVATE_KEY` to the old value.
+2. Restart the backend.
+3. Revert `stellar.toml` to the old `SIGNING_KEY`.
+4. Confirm challenge signing works with the old key.
 
-#### Step 4: Verify Rotation
+Rollback takes ~10 minutes (client cache expiration) plus restart time.
 
-Test the authentication flow:
-1. Request a new challenge: `GET /api/auth?account=G<your_public_key>`
-2. Sign the challenge with Freighter
-3. Submit the signed challenge: `POST /api/auth`
-4. Verify that a JWT token is returned successfully
+### Coordination with Clients
 
-### Impact on Active Sessions
+- **Direct clients** (your own frontend, mobile apps): Update them *after* `stellar.toml` and the backend are ready. Test in staging.
+- **Third-party clients** (other services using your federation): Announce the rotation in advance. Provide a grace period in which both old and new keys are accepted (see dual-key support below).
 
-- **Minimal Impact**: Existing JWT tokens remain valid. The `SERVER_PRIVATE_KEY` is only used during the initial SEP-10 challenge exchange, not for ongoing session validation.
-- **Pending Challenges**: Any challenge transactions that were requested but not yet signed/verified become invalid and must be re-requested.
+### Dual Public Key Support (Grace Period)
 
-### Impact on Turret Jobs
+To allow clients time to update their config without breaking mid-request:
 
-- **No Impact**: Turret jobs do not depend on `SERVER_PRIVATE_KEY`. The turret signing flow uses user-signed challenges, not server-signed challenges.
+1. Keep the old `SERVER_PRIVATE_KEY` deployed and skip step 3 (deploy new secret) initially.
+2. Update `stellar.toml` to list *both* the old and new `SIGNING_KEY` values in a comment or separate field (if your toml allows it), or coordinate via federation documentation.
+3. Wait 24+ hours for client-side caches to expire and clients to fetch the new `stellar.toml`.
+4. *Then* deploy the new `SERVER_PRIVATE_KEY` and restart.
+5. After another 24+ hours, remove the old public key from `stellar.toml`.
+
+This eliminates the need for simultaneous client updates and allows third-party integrations to migrate at their own pace.
 
 ---
 
-## Combined Rotation Procedure
+## PAYMENT_SIGNING_SECRET Rotation
 
-To rotate both secrets simultaneously with minimal disruption:
+**Purpose**: HMAC key for signing outbound requests (e.g., payment notifications to clients). Also validates inbound signed webhook requests.
 
-1. **Generate new secrets**:
+**Impact**: All in-flight signed requests using the old secret are rejected. Clients and webhooks fail until they receive and use the new secret.
+
+**Downtime**: Potential service disruption if clients or webhook subscribers are not updated simultaneously.
+
+### Procedure
+
+1. **Generate a new secret**:
    ```bash
-   # New JWT secret
-   openssl rand -hex 32
-   
-   # New Stellar keypair
-   node -e "const {Keypair} = require('@stellar/stellar-sdk'); const kp = Keypair.random(); console.log('Secret:', kp.secret());"
+   openssl rand -base64 48
    ```
 
-2. **Perform graceful JWT rotation** (see Option 1 above) first.
+2. **Plan a maintenance window**:
+   - Coordinate with all clients and webhook subscribers.
+   - Provide them with the new secret in advance (via secure channel, not in PRs or public docs).
+   - Announce the rotation date and window (e.g., "2025-03-15 02:00–02:10 UTC").
 
-3. **After the JWT grace window** (7 days), rotate `SERVER_PRIVATE_KEY` immediately.
+3. **Distribute the new secret**:
+   - Email or securely share the new secret with all integrators.
+   - Give them time to update their configuration (at least 24 hours).
 
-4. **Restart the backend** after both rotations are complete.
+4. **Update the backend**:
+   - Deploy a version of the backend that accepts *both* old and new `PAYMENT_SIGNING_SECRET`.
+   - See dual-secret support below; implement it before rotation.
 
----
+5. **Verify dual-secret acceptance**:
+   - Test a webhook or payment request signed with the old secret; it should succeed.
+   - Test with the new secret; it should also succeed.
 
-## Monitoring and Validation
+6. **Notify clients**:
+   - Send a reminder: "New secret is live. Old secret will be disabled on [date]."
 
-After rotation, monitor the following:
+7. **Disable the old secret**:
+   - After 7–14 days (or your SLA window), update the backend to accept *only* the new secret.
+   - Remove the old secret from the environment.
+   - Redeploy and verify.
 
-1. **Authentication Success Rate**: Check logs for increased 401 errors on `/api/auth` endpoints
-2. **Token Refresh Errors**: Monitor `/api/auth/refresh` for failures
-3. **User Complaints**: Watch for reports of authentication failures
-4. **Turret Job Management**: Verify that users can still deploy, pause, and resume jobs
+### Request Signing Flow
 
-### Log Monitoring
+The backend signs outbound requests with `PAYMENT_SIGNING_SECRET` (see `src/utils/requestSignature.js`):
 
-```bash
-# Check for authentication errors
-tail -f backend/logs/app.log | grep "Unauthorized"
-
-# Check for JWT verification failures
-tail -f backend/logs/app.log | grep "JWT"
+```javascript
+const secret = process.env.PAYMENT_SIGNING_SECRET || DEFAULT_SECRET;
+const signature = generateRequestSignature(
+  { timestamp: Date.now(), method: "POST", path: "/webhook", body: JSON.stringify(payload) },
+  secret
+);
+// Outbound request carries X-Signature and X-Timestamp headers
 ```
 
+Clients verify the signature using the same secret. If the secret changes, their verification fails.
+
+### Dual Secret Support
+
+Update `src/utils/requestSignature.js` to try both secrets:
+
+```javascript
+function verifyRequestSignature(parts, options = {}) {
+  const { secret = getSigningSecret(), ... } = options;
+  const { secret_previous = process.env.PAYMENT_SIGNING_SECRET_PREVIOUS } = options;
+  
+  // Try current secret
+  let result = attemptVerify(parts, secret);
+  if (result.ok) return result;
+  
+  // Try previous secret if current fails
+  if (secret_previous && secret_previous !== secret) {
+    result = attemptVerify(parts, secret_previous);
+    if (result.ok) return result;
+  }
+  
+  return { ok: false, reason: "Invalid request signature", code: "invalid_signature" };
+}
+```
+
+This allows the server to accept both old and new secrets for the duration of the rotation window.
+
+### Rollback
+
+If webhook subscribers report signature verification failures:
+
+1. Verify the new secret was delivered correctly (check your email/notification logs).
+2. Revert `PAYMENT_SIGNING_SECRET` to the old value and redeploy.
+3. Confirm webhooks are signed with the old secret again.
+4. Contact integrators to troubleshoot their configuration.
+
+Rollback takes a few minutes plus verification.
+
 ---
 
-## Security Considerations
+## Checklist for Safe Rotation
 
-1. **Never commit secrets to version control**: Ensure `.env` files are in `.gitignore`
-2. **Use strong secrets**: Generate cryptographically random secrets (minimum 32 bytes for JWT_SECRET)
-3. **Limit secret access**: Restrict `.env` file access to necessary personnel only
-4. **Document rotations**: Maintain a log of when secrets were rotated and by whom
-5. **Test in staging**: Always test rotation procedures in a staging environment before production
+### Before Any Rotation
+
+- [ ] Notify stakeholders (users, integrators, support team).
+- [ ] Schedule during low-traffic hours.
+- [ ] Have a rollback procedure ready.
+- [ ] Test in staging with the new secret.
+- [ ] Ensure you can access the old secret if rollback is needed.
+
+### JWT_SECRET
+
+- [ ] Generate new secret: `openssl rand -base64 48`
+- [ ] Update environment variable.
+- [ ] Redeploy backend.
+- [ ] Verify new logins receive valid tokens.
+- [ ] Monitor error logs for 401 spikes.
+
+### SERVER_PRIVATE_KEY
+
+- [ ] Generate new keypair using a proper Stellar key generator.
+- [ ] Update `.well-known/stellar.toml` with new public key.
+- [ ] Verify `stellar.toml` is served with low cache TTL.
+- [ ] Set `SERVER_PRIVATE_KEY` in backend environment.
+- [ ] Restart backend.
+- [ ] Wait 10+ minutes for client caches to expire.
+- [ ] Test SEP-10 auth flow.
+- [ ] Coordinate with third-party clients; provide grace period if possible.
+
+### PAYMENT_SIGNING_SECRET
+
+- [ ] Generate new secret: `openssl rand -base64 48`
+- [ ] Implement dual-secret support (optional but recommended).
+- [ ] Distribute new secret to all clients and webhook subscribers.
+- [ ] Update environment variable.
+- [ ] Redeploy backend with dual-secret support active.
+- [ ] Verify both old and new secrets are accepted.
+- [ ] After grace period, disable old secret and redeploy.
 
 ---
 
-## Emergency Rotation (Security Compromise)
+## Incident Response
 
-If either secret is suspected to be compromised:
+### Scenario: JWT tokens stop validating (rollback needed)
 
-1. **Immediate Rotation**: Use the immediate rotation procedures (Option 2 for JWT, standard for SERVER_PRIVATE_KEY)
-2. **Force Session Invalidation**: All users must re-authenticate
-3. **Audit Logs**: Review authentication logs for suspicious activity
-4. **Notify Users**: Communicate the security incident and recommend re-authentication
-5. **Rotate Other Secrets**: Consider rotating other secrets (API keys, database credentials) as a precaution
+1. Revert `JWT_SECRET` to the previous value.
+2. Redeploy backend.
+3. Confirm new logins succeed.
+4. Users re-authenticate automatically.
+
+**Time to recovery**: ~2 minutes.
+
+### Scenario: Challenge signing fails (SERVER_PRIVATE_KEY issue)
+
+1. Check `getServerKeypair()` in `src/routes/auth.js` — is the cache valid?
+2. Verify `SERVER_PRIVATE_KEY` is set and is a valid Stellar secret key.
+3. Check `.well-known/stellar.toml` — does `SIGNING_KEY` match the public key?
+4. Revert `SERVER_PRIVATE_KEY` to the old value if uncertain.
+5. Restart the backend.
+
+**Time to recovery**: ~5 minutes + cache expiration.
+
+### Scenario: Webhook requests are rejected (PAYMENT_SIGNING_SECRET issue)
+
+1. Verify webhook subscriber is using the *current* secret from their config.
+2. Check backend logs for signature mismatch errors.
+3. If the old secret is still expected, deploy dual-secret support immediately.
+4. Confirm webhook subscriber receives the new secret via their secure channel.
+
+**Time to recovery**: ~5 minutes (dual support) or hours (coordination with subscriber).
+
+---
+
+## Automation & Monitoring
+
+### Logging
+
+Add logs when secrets are accessed or verified:
+
+```javascript
+// In auth.js
+console.info(`JWT verification attempt for ${req.ip}`);
+
+// In requestSignature.js
+if (!result.ok) {
+  console.warn(`Signature verification failed: ${result.reason}`);
+}
+```
+
+Monitor for:
+- Sudden spikes in 401 errors (JWT rotation gone wrong).
+- Signature verification failures on webhook endpoints (PAYMENT_SIGNING_SECRET mismatch).
+
+### Alerts
+
+Set up alerts for:
+- `>N` 401 errors in M minutes → potential JWT issue.
+- `>N` signature verification failures in M minutes → potential secret issue.
+
+### Testing
+
+Add integration tests that verify:
+- JWT token verification with current secret.
+- Challenge signing with current SERVER_PRIVATE_KEY.
+- Request signature verification with current PAYMENT_SIGNING_SECRET.
+
+Rotate secrets in staging (point env to a dummy secret, then back) to verify rollback procedures work.
 
 ---
 
 ## References
 
-- [SEP-10: Stellar Web Authentication](https://stellar.org/sep-10)
+- [Stellar SEP-0010: Stellar Web Authentication](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0021.md)
 - [JWT Best Practices](https://tools.ietf.org/html/rfc8725)
-- [backend/.env.example](../backend/.env.example)
-- [backend/src/middleware/auth.js](../backend/src/middleware/auth.js)
-- [backend/src/routes/auth.js](../backend/src/routes/auth.js)
-- [ENV.md](../ENV.md)
+- [HMAC-based Signatures](https://tools.ietf.org/html/rfc2104)
+- Backend implementation: `backend/src/middleware/auth.js`, `backend/src/utils/requestSignature.js`, `backend/src/routes/auth.js`

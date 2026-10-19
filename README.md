@@ -1,44 +1,48 @@
 # Stellar-MicroPay: Streaming Payment Channels using Soroban
 
+[![Discord](https://img.shields.io/badge/Discord-%23greenpay-5865F2?logo=discord&logoColor=white)](https://discord.gg/greenpay)
+[![Telegram](https://img.shields.io/badge/Telegram-GreenPay%20Community-2CA5E0?logo=telegram&logoColor=white)](https://t.me/greenpay_community)
+[![Hacktoberfest](https://img.shields.io/badge/Hacktoberfest-2026-orange?logo=hacktoberfest&logoColor=white)](https://hacktoberfest.com)
+
 ## Overview
 
 This project implements a Soroban smart contract for streaming payment channels on the Stellar network. The contract allows a payer to deposit XLM and stream it to a recipient at a defined rate (e.g., 1 XLM per hour). The recipient can claim the streamed amount at any time.
 
-## Architecture
+For an introduction to Stellar and Soroban terminology (such as stroops, ledgers, XDR, Freighter, and Turrets), consult the [Stellar & Soroban Glossary](GLOSSARY.md).
 
-```mermaid
-flowchart LR
-    user[User browser] --> frontend[Next.js frontend]
-    frontend --> wallet[Freighter wallet]
-    wallet --> frontend
-    frontend --> backend[Express backend API]
-    backend --> horizon[Stellar Horizon]
-    frontend --> horizon
-    frontend --> soroban[Soroban RPC]
-    soroban --> contract[MicroPayContract]
-    contract --> stellar[Stellar testnet/mainnet]
-    horizon --> stellar
+## Features
 
-    backend -. tips, usernames, analytics, webhooks .-> frontend
-    wallet -. signs XDR .-> stellar
-```
-
-- **Frontend** builds payment, tip, receipt, trustline, trade, and account-management flows, then asks Freighter to sign Stellar transaction XDR.
-- **Freighter** owns user keys and returns signed XDR; private keys never pass through the app.
-- **Backend API** handles account, payment-history, federation, SEP-0010 auth, creator-tip, analytics, Turrets, and webhook endpoints with `/api/v1/` versioning and HTTP deprecation policy headers.
-- **Horizon** serves account balances, payment history, fee stats, transaction submission, and network data.
-- **Soroban RPC and `MicroPayContract`** record on-chain tips and receipt metadata through contract invocations.
-
-## Features & Documentation
-
-- **API Versioning & Deprecation Policy**: Standard `/api/v1/` base URL with deprecation & sunset headers ([`docs/api.md`](./docs/api.md))
 - **Stream Creation**: Open payment streams with custom rates and deposits
 - **Claim Payments**: Recipients can claim available funds at any time
 - **Top-up Streams**: Add more funds to existing streams
 - **Close Streams**: Payers can close streams and receive refunds for unstreamed portions
-- **Username Payments & Federation**: Map `@username` to Stellar public keys ([`ROADMAP.md`](./ROADMAP.md))
-- **QR Code Payments & Creator Tipping**: Public tipping pages with preset amounts ([`ANALYTICS_GUIDE.md`](./ANALYTICS_GUIDE.md))
-- **Disaster Recovery & Backup Runbooks**: Tested RPO/RTO backup and restore drills ([`docs/RUNBOOK_DISASTER_RECOVERY.md`](./docs/RUNBOOK_DISASTER_RECOVERY.md))
+- **Rate-based Streaming**: Payments are calculated based on ledger progression
+
+## Architecture
+
+Stellar-MicroPay is a three-tier Web3 application. The diagram below shows how the
+pieces fit together, from the browser down to the Soroban contract on the Stellar
+network. A more detailed breakdown lives in [`docs/architecture.md`](docs/architecture.md).
+
+```mermaid
+flowchart TD
+    subgraph Browser["User's Browser"]
+        FE["Next.js Frontend<br/>(React + Tailwind)"]
+        FW["Freighter Wallet<br/>(signs transactions)"]
+        FE <--> FW
+    end
+
+    BE["Node.js / Express Backend API"]
+    HZ["Stellar Horizon API"]
+    SN["Stellar Network<br/>(validators)"]
+    SC["Soroban Smart Contract<br/>(Rust/WASM)"]
+
+    FE -->|"REST / HTTP"| BE
+    BE -->|"Horizon REST"| HZ
+    FE -.->|"submit signed XDR"| HZ
+    HZ <--> SN
+    SN <-->|"Soroban"| SC
+```
 
 ## Contract Structure
 
@@ -47,11 +51,12 @@ flowchart LR
 ```rust
 pub struct Stream {
     pub payer: Address,           // Address of the payer
-    pub recipient: Address,       // Address of the recipient  
+    pub recipient: Address,       // Address of the recipient
     pub rate_per_ledger: i128,    // Amount streamed per ledger (in stroops)
     pub deposited: i128,          // Total amount deposited (in stroops)
     pub claimed: i128,            // Total amount claimed (in stroops)
     pub start_ledger: u32,        // Ledger number when stream started
+    pub token: Address,           // Token escrowed at open time
 }
 ```
 
@@ -83,30 +88,77 @@ pub struct Stream {
 #### `get_claimable(stream_id) -> i128`
 - Calculates claimable amount without claiming
 
+#### `get_stream_history(stream_id) -> Vec<StreamEvent>`
+- Returns the full append-only event log for a stream
+- Each entry records the `event_type` (`claim` / `topup` / `close`), the
+  `amount`, and the `ledger` it happened on
+
+#### `get_stream_count() -> u32`
+- Returns the number of streams ever opened
+
+## Administration
+
+#### `set_max_rate(admin, max_rate)`
+- Sets an admin-configurable cap on `rate_per_ledger` for new streams
+- `open_stream` rejects any rate above the cap with `ContractError::RateTooHigh`
+- A cap of `0` (the default) disables the cap entirely
+- Lowering the cap does not affect streams that already exist
+
+#### `get_max_rate() -> i128`
+- Returns the current cap (`0` means uncapped)
+
+#### `freeze(admin)` / `unfreeze(admin)`
+- `freeze` sets a `Frozen` flag that blocks every state-changing entry point
+  with `ContractError::Frozen`
+- `unfreeze` clears it
+- Read-only getters (`get_stream`, `get_claimable`, `get_stream_history`,
+  `is_frozen`, …) keep working while frozen, so monitoring and incident
+  response are not blinded by a freeze
+
+#### `is_frozen() -> bool`
+- Whether the contract is currently frozen
+
 ## Security Features
 
+To report a vulnerability, see [SECURITY.md](SECURITY.md). It also covers
+the threat model, scope and response times.
+
 - **Authorization**: Only recipients can claim, only payers can close/top-up
-- **Rate Validation**: Rates must be positive
+- **Rate Validation**: Rates must be positive and within the admin cap
 - **Deposit Validation**: Deposits must be positive
-- **Overflow Protection**: Uses checked arithmetic operations
+- **Overflow Protection**: Saturating arithmetic; accrual is capped at the
+  funded window so `total_streamed <= deposited` holds structurally
+- **Emergency Pause**: Admin can freeze all state changes without a redeploy
 - **Access Control**: Proper authentication checks for all operations
 
 ## Mathematical Calculations
 
 ### Claimable Amount Calculation
 ```
-elapsed_ledgers = current_ledger - start_ledger
-total_streamed = rate_per_ledger * elapsed_ledgers
-claimable = total_streamed - claimed
-actual_claim = min(claimable, deposited - claimed)
+elapsed_ledgers = current_ledger - start_ledger // ledgers elapsed since start
+total_streamed = rate_per_ledger * elapsed_ledgers // amount accrued to date
+claimable = total_streamed - claimed // accrued funds not yet claimed
+actual_claim = min(claimable, deposited - claimed) // cap at funds still deposited
 ```
+With zero elapsed ledgers, nothing new is claimable. Once the deposit is exhausted,
+the remaining-deposit cap keeps further claims at zero.
+
+Capping `elapsed_ledgers` at `funded_ledgers` before the multiply is what makes
+the arithmetic total: the product is bounded by `deposited`, so it can neither
+overflow `i128` nor exceed the escrow, for any combination of inputs.
 
 ### Refund Calculation
 ```
-elapsed_ledgers = current_ledger - start_ledger
-total_streamed = rate_per_ledger * elapsed_ledgers
-refundable = deposited - max(total_streamed, claimed)
+elapsed_ledgers = current_ledger - start_ledger // ledgers elapsed since start
+total_streamed = rate_per_ledger * elapsed_ledgers // amount accrued to date
+refundable = deposited - max(total_streamed, claimed) // funds neither streamed nor claimed
 ```
+With zero elapsed ledgers and no prior claims, the full deposit is refundable.
+When the stream is exhausted, the maximum reaches the deposit and the refund is zero.
+
+Claims and refunds split the deposit exactly: `claimed + refundable == deposited`
+for any claim schedule, which `test_close_stream_after_claims` and
+`fuzz_repeated_claims_never_exceed_deposit` both assert.
 
 ## Usage Examples
 
@@ -160,71 +212,57 @@ The contract includes comprehensive tests covering:
 - Close and refund calculations
 - Authorization and validation
 - Error conditions
+- Rate cap at, below, and above the configured maximum
+- Stream event log contents and ordering
+- Frozen and unfrozen behavior across every entry point
+
+Run everything with `cargo test`, or just the property tests with:
+
+```bash
+cargo test fuzz -- --nocapture
+```
+
+The property tests replay saved counterexamples from
+`contracts/stellar-micropay-contract/proptest-regressions/lib.txt` before
+generating new cases, so a bug found once stays covered.
+
+The wasm build is not exercised by `cargo test`; it requires stellar-cli
+v25.2.0+ (`stellar contract build`). CI runs the same check.
 
 ## Installation and Deployment
 
+### Docker
+
+You can run the pre-built images from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/emmy123222/stellar-micropay-backend:latest
+docker pull ghcr.io/emmy123222/stellar-micropay-frontend:latest
+```
+
+To run the stack locally, see the [Docker Compose matrix](docs/deployment.md#compose-matrix). It covers which compose file to use for dev, test, staging and prod.
+
+### Manual Setup
+
 1. Install Rust and Soroban SDK
 2. Clone this repository
-3. Build the contract: `cargo build --release --target wasm32-unknown-unknown`
+3. Build the contract: `stellar contract build` (soroban-sdk 28 requires
+   stellar-cli v25.2.0+ for the wasm build)
 4. Deploy to Stellar testnet/mainnet
 5. Initialize contract with required parameters
 
-## Development Commands
-
-Common development tasks can be run using `make` or `npm`:
-
-### Make targets
-```bash
-make dev                 # Start frontend + backend concurrently (hot-reload)
-make test                # Run all tests (frontend + backend unit tests)
-make lint                # Lint frontend + backend code
-make build               # Build Docker images
-make contracts-build     # Build Soroban contracts WASM
-make contracts-test      # Run Soroban contract tests
-```
-
-### NPM scripts
-```bash
-npm run clean            # Remove build artifacts (.next, dist, target)
-npm run load-test        # Run load tests
-npm run prepare          # Install Husky hooks (runs automatically after npm install)
-```
-
-### Commit conventions
-
-This project uses [Conventional Commits](https://www.conventionalcommits.org/) enforced via commitlint and Husky. Commit messages are automatically validated on commit.
-
-Acceptable types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`, `ci`, `revert`
-
-Example:
-```bash
-git commit -m "feat: add streaming payment support"
-git commit -m "fix: correct claim amount calculation"
-```
-
-## Freighter Setup
-
-New contributors need a funded Stellar testnet account before they can sign and test app flows locally.
-
-1. Install the Freighter browser extension from `https://freighter.app/`.
-2. Open Freighter and create a new wallet, or import an existing development wallet.
-3. Save the recovery phrase somewhere secure. Do not use a production wallet for local testing.
-4. In Freighter, switch the network to **Testnet**.
-5. Copy the public key for the active testnet account.
-6. Fund the account with Friendbot:
-   - In the app, connect Freighter and use the Friendbot funding action shown for unfunded testnet accounts.
-   - Or open `https://friendbot.stellar.org/?addr=<PUBLIC_KEY>` after replacing `<PUBLIC_KEY>` with your copied testnet public key.
-   - Or run `stellar keys fund <identity-name> --network testnet` if you are using Stellar CLI identities.
-7. Confirm funding by refreshing the dashboard or checking the account on Stellar Laboratory testnet explorer.
-8. Use that funded account for local payments, contract invocations, and end-to-end tests that require wallet signing.
-
 ## Acceptance Criteria Met
 
-✅ **cargo test passes for all streaming tests**  
-✅ **Claim amount calculated correctly at any ledger offset**  
-✅ **Top-up increases the stream duration**  
-✅ **Close refunds the correct unclaimed amount**  
+✅ **`cargo test` passes for all streaming tests** (36 tests)
+✅ **Claim amount calculated correctly at any ledger offset**
+✅ **Top-up increases the stream duration**
+✅ **Close refunds the correct unclaimed amount** — `claimed + refund == deposited`
 ✅ **Only the recipient can claim, only the payer can close**
+✅ **Admin-configurable rate cap** — `set_max_rate`, `0` disables it
+✅ **No arithmetic panic for arbitrary inputs** — proptest over 1000 random
+   `(rate, elapsed, deposit, claimed)` tuples
+✅ **Full claim/top-up history** — `get_stream_history` returns the event log
+✅ **Emergency pause** — `freeze` / `unfreeze`, read-only getters stay available
 
 ## Technical Details
 
@@ -233,35 +271,60 @@ New contributors need a funded Stellar testnet account before they can sign and 
 - **Security**: Comprehensive input validation and access controls
 - **Compliance**: Follows Soroban best practices and standards
 
-## FAQ
+## Documentation
 
-See [FAQ.md](FAQ.md) for answers to common questions about Stellar MicroPay.
+- [📖 Stellar & Soroban Glossary](GLOSSARY.md) — Plain-English guide to Stellar and Soroban terminology (XLM, stroops, ledgers, sequence numbers, Horizon, Soroban, XDR, Freighter, SEP-0007, SEP-0010, trustlines, federation, and turrets).
+- [🤝 Contributing Guide](CONTRIBUTING.md) — Guidelines for contributing and setting up the development environment, including how to [add a new locale](docs/i18n.md).
+- [🌍 Adding a New Locale](docs/i18n.md) — Step-by-step guide to shipping a translation: catalog structure, registration in `frontend/lib/i18n.ts`, key parity, fallback, quality rules and the i18n test suites.
+- [🚀 Deployment Guide](DEPLOYMENT_GUIDE.md) — Instructions for deploying to production.
+- [🐳 Docker Compose matrix](docs/deployment.md#compose-matrix) — Which compose file and Dockerfile to use for dev, test, staging and prod, with required secrets, up commands and known issues.
+- [📚 Technical Architecture & Docs](docs/) — Detailed documentation on architecture, Ledger hardware wallet support, Turrets, analytics, and APIs.
+
+## 💬 Community & Discussion
+
+Connect with contributors, ask questions, and share ideas:
+- **Discord**: Join our community Discord in the [#greenpay](https://discord.gg/greenpay) channel.
+- **Telegram**: Join the [GreenPay Community](https://t.me/greenpay_community) Telegram group.
+- **Hacktoberfest**: Check out our [Contributing Guide](CONTRIBUTING.md#hacktoberfest) to get started on open issues during October!
+
+## Contributors
+
+Thanks to everyone who has contributed to Stellar-MicroPay! 🎉
+
+<a href="https://github.com/Emmy123222/Stellar-MicroPay/graphs/contributors">
+  <img src="https://contributors-img.web.app/image?repo=Emmy123222/Stellar-MicroPay" alt="Contributors" />
+</a>
+
+The contributor graph above is rendered by the [`contributors-img`](https://contributors-img.web.app)
+service (the maintained successor to the `contributors-img` GitHub Action). Each name below links
+to its GitHub profile.
+
+### Thanks to
+
+- [@Emmy123222](https://github.com/Emmy123222)
+- [@emmanuel](https://github.com/emmanuel)
+- [@iamTissan](https://github.com/iamTissan)
+- [@zeemscript](https://github.com/zeemscript)
+- [@Ennyhorla1](https://github.com/Ennyhorla1)
+- [@Seunfunmi-319509](https://github.com/Seunfunmi-319509)
+- [@AGWAM001](https://github.com/AGWAM001)
+- [@johnsmccain](https://github.com/johnsmccain)
+- [@alabiopeyemi](https://github.com/alabiopeyemi)
+- [@Hollujay](https://github.com/Hollujay)
+- [@Gojv-byte](https://github.com/Gojv-byte)
+- [@Manuelshub](https://github.com/Manuelshub)
+- [@Cjay-Cyber-2](https://github.com/Cjay-Cyber-2)
+- [@Nanle-code](https://github.com/Nanle-code)
+- [@Robinsonchiziterem](https://github.com/Robinsonchiziterem)
+- [@gboigwe](https://github.com/gboigwe)
+- [@devfoma](https://github.com/devfoma)
+- [@nonso7](https://github.com/nonso7)
+- [@Emelie-Dev](https://github.com/Emelie-Dev)
+- [@harystyleseze](https://github.com/harystyleseze)
+
+...and [all the other contributors](https://github.com/Emmy123222/Stellar-MicroPay/graphs/contributors)
+who have helped shape this project.
 
 ## License
 
 This project is open source and available under the MIT License.
-
-## Contributing Guide
-
-
-How to Contribute 
-
-• Fork the repository. 
-
-• Clone your fork to your local machine. 
-
-• Create a new branch for your task. 
-
-git checkout -b feature/your-task-name 
-
-• Make your changes. 
-
-• Commit clearly. 
-
-git commit -m "Add: short description" 
-
-• Push your branch. 
-
-git push origin feature/your-task-name 
-
-• Open a Pull Request.

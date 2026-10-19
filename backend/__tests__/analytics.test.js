@@ -5,22 +5,34 @@
 
 "use strict";
 
+const request = require("supertest");
+const jwt = require("jsonwebtoken");
 const analyticsService = require("../src/services/analyticsService");
 const stellarService = require("../src/services/stellarService");
+const loggerModule = require("../src/utils/logger");
+const { JWT_SECRET } = require("../src/middleware/auth");
+const {
+  clearAnalyticsCache,
+  startCacheSweep,
+  stopCacheSweep,
+  getCachedAnalytics,
+  setCachedAnalytics,
+} = require("../src/services/analyticsService");
 
 // Mock Stellar service
 jest.mock("../src/services/stellarService");
 
+
 describe("Analytics Service", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
-    // Clear cache for each test
-    analyticsService.clearCache("GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJLVXKJ46ZGFWTTNQNXNHTJXW");
+    clearAnalyticsCache();
+    await analyticsService.clearCache("GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJLVXKJ46ZGFWTTNQNXNHTJXW");
   });
 
-  const testPublicKey = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJLVXKJ46ZGFWTTNQNXNHTJXW";
+  const testPublicKey =
+    "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJLVXKJ46ZGFWTTNQNXNHTJXW";
 
-  // Mock payment data
   const mockPayments = [
     {
       id: "1",
@@ -91,13 +103,11 @@ describe("Analytics Service", () => {
       const result = await analyticsService.getSummary(testPublicKey);
 
       expect(result).toHaveProperty("publicKey", testPublicKey);
-      expect(result).toHaveProperty("totalSentXLM", "175.0000000"); // 100 + 50 + 25
-      expect(result).toHaveProperty("totalReceivedXLM", "275.0000000"); // 200 + 75
+      expect(result).toHaveProperty("totalSentXLM", "175.0000000");
+      expect(result).toHaveProperty("totalReceivedXLM", "275.0000000");
       expect(result).toHaveProperty("uniqueCounterparties", 4);
       expect(result).toHaveProperty("averageTransactionSize");
       expect(result).toHaveProperty("totalTransactions", 5);
-
-      // Average = (175 + 275) / 5 = 90
       expect(parseFloat(result.averageTransactionSize)).toBeCloseTo(90, 5);
     });
 
@@ -131,16 +141,12 @@ describe("Analytics Service", () => {
       const result = await analyticsService.getTopRecipients(testPublicKey);
 
       expect(result).toHaveProperty("publicKey", testPublicKey);
-      expect(result.topRecipients).toHaveLength(2); // Only 2 unique recipients in mock data
+      expect(result.topRecipients).toHaveLength(2);
       expect(result.count).toBe(2);
-
-      // First recipient should have total of 150 (100 + 50)
       expect(result.topRecipients[0]).toEqual({
         address: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXWS7",
         totalXLMSent: "150.0000000",
       });
-
-      // Second recipient should have total of 25
       expect(result.topRecipients[1]).toEqual({
         address: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXWS8",
         totalXLMSent: "25.0000000",
@@ -152,7 +158,6 @@ describe("Analytics Service", () => {
 
       const result = await analyticsService.getTopRecipients(testPublicKey);
 
-      // Should only count sent payments (3), received payments should be ignored
       expect(result.topRecipients.length).toBeLessThanOrEqual(5);
       result.topRecipients.forEach((recipient) => {
         expect(recipient.address).toBeDefined();
@@ -161,7 +166,9 @@ describe("Analytics Service", () => {
     });
 
     it("should return empty array when no sent payments", async () => {
-      const receivedPayments = mockPayments.filter((p) => p.type === "received");
+      const receivedPayments = mockPayments.filter(
+        (p) => p.type === "received",
+      );
       stellarService.getPayments.mockResolvedValue(receivedPayments);
 
       const result = await analyticsService.getTopRecipients(testPublicKey);
@@ -213,7 +220,6 @@ describe("Analytics Service", () => {
       expect(result).toHaveProperty("publicKey", testPublicKey);
       expect(result.activityByDay).toHaveLength(7);
 
-      // Days should be in order Sunday through Saturday
       const dayNames = [
         "Sunday",
         "Monday",
@@ -236,12 +242,11 @@ describe("Analytics Service", () => {
 
       const result = await analyticsService.getActivityByDay(testPublicKey);
 
-      // Jan 1, 2024 = Monday, Jan 2 = Tuesday, Jan 3 = Wednesday, Jan 4 = Thursday, Jan 10 = Wednesday
       const totalCount = result.activityByDay.reduce(
         (sum, day) => sum + day.transactionCount,
-        0
+        0,
       );
-      expect(totalCount).toBe(5); // Total transactions in mockPayments
+      expect(totalCount).toBe(5);
     });
 
     it("should handle empty payment history", async () => {
@@ -266,202 +271,163 @@ describe("Analytics Service", () => {
     });
   });
 
-  describe("getCohortBreakdown", () => {
-    const cohortPayments = [
-      {
-        id: "c1",
-        type: "sent",
-        amount: "10",
-        asset: "XLM",
-        from: testPublicKey,
-        to: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW01",
-        createdAt: "2026-07-10T12:00:00Z",
-        transactionHash: "cohort-hash-1",
-        pagingToken: "cohort-token-1",
-      },
-      {
-        id: "c2",
-        type: "sent",
-        amount: "5",
-        asset: "XLM",
-        from: testPublicKey,
-        to: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW01",
-        createdAt: "2026-07-12T12:00:00Z",
-        transactionHash: "cohort-hash-2",
-        pagingToken: "cohort-token-2",
-      },
-      {
-        id: "c3",
-        type: "sent",
-        amount: "7",
-        asset: "XLM",
-        from: testPublicKey,
-        to: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW02",
-        createdAt: "2026-07-15T12:00:00Z",
-        transactionHash: "cohort-hash-3",
-        pagingToken: "cohort-token-3",
-      },
-      {
-        id: "c4",
-        type: "received",
-        amount: "20",
-        asset: "XLM",
-        from: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW03",
-        to: testPublicKey,
-        createdAt: "2026-07-18T12:00:00Z",
-        transactionHash: "cohort-hash-4",
-        pagingToken: "cohort-token-4",
-      },
-      {
-        id: "c5",
-        type: "received",
-        amount: "15",
-        asset: "XLM",
-        from: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW03",
-        to: testPublicKey,
-        createdAt: "2026-07-22T12:00:00Z",
-        transactionHash: "cohort-hash-5",
-        pagingToken: "cohort-token-5",
-      },
-      {
-        id: "c6",
-        type: "sent",
-        amount: "4",
-        asset: "XLM",
-        from: testPublicKey,
-        to: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW04",
-        createdAt: "2026-06-03T12:00:00Z",
-        transactionHash: "cohort-hash-6",
-        pagingToken: "cohort-token-6",
-      },
-      {
-        id: "c7",
-        type: "received",
-        amount: "2",
-        asset: "XLM",
-        from: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW05",
-        to: testPublicKey,
-        createdAt: "2026-06-20T12:00:00Z",
-        transactionHash: "cohort-hash-7",
-        pagingToken: "cohort-token-7",
-      },
-      {
-        id: "c8",
-        type: "received",
-        amount: "9",
-        asset: "XLM",
-        from: "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXW06",
-        to: testPublicKey,
-        createdAt: "2026-05-05T12:00:00Z",
-        transactionHash: "cohort-hash-8",
-        pagingToken: "cohort-token-8",
-      },
-    ];
-
-    beforeEach(() => {
-      jest.useFakeTimers();
-      jest.setSystemTime(new Date("2026-07-25T12:00:00Z"));
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-    });
-
-    it("should group repeat and one-time counterparties by month", async () => {
-      stellarService.getPayments.mockResolvedValue(cohortPayments);
-
-      const result = await analyticsService.getCohortBreakdown(testPublicKey, {
-        period: "month",
-        periods: 3,
-      });
-
-      expect(result.publicKey).toBe(testPublicKey);
-      expect(result.period).toBe("month");
-      expect(result.periods).toBe(3);
-      expect(result.cohorts).toHaveLength(3);
-
-      const july = result.cohorts[2];
-      expect(july.label).toBe("Jul 2026");
-      expect(july.sent.counterparties.repeatCounterparties).toBe(1);
-      expect(july.sent.counterparties.oneTimeCounterparties).toBe(1);
-      expect(july.sent.paymentCount).toBe(3);
-      expect(july.received.counterparties.repeatCounterparties).toBe(1);
-      expect(july.received.counterparties.oneTimeCounterparties).toBe(0);
-      expect(july.repeatRate).toBeGreaterThan(0);
-
-      const june = result.cohorts[1];
-      expect(june.label).toBe("Jun 2026");
-      expect(june.sent.counterparties.oneTimeCounterparties).toBe(1);
-      expect(june.received.counterparties.oneTimeCounterparties).toBe(1);
-    });
-  });
-
   describe("clearCache", () => {
     it("should clear cached data for a public key", async () => {
       stellarService.getPayments.mockResolvedValue(mockPayments);
 
-      // First call — should fetch from service
       await analyticsService.getSummary(testPublicKey);
       expect(stellarService.getPayments).toHaveBeenCalledTimes(1);
 
-      // Second call — should use cache
       await analyticsService.getSummary(testPublicKey);
       expect(stellarService.getPayments).toHaveBeenCalledTimes(1);
 
       // Clear cache
-      analyticsService.clearCache(testPublicKey);
+      await analyticsService.clearCache(testPublicKey);
 
       // Third call — should fetch again
       await analyticsService.getSummary(testPublicKey);
       expect(stellarService.getPayments).toHaveBeenCalledTimes(2);
     });
+
+    it("should return the number of invalidated entries", async () => {
+      stellarService.getPayments.mockResolvedValue(mockPayments);
+
+      await analyticsService.getSummary(testPublicKey);
+      await analyticsService.getTopRecipients(testPublicKey);
+      await analyticsService.getActivityByDay(testPublicKey);
+
+      expect(await analyticsService.clearCache(testPublicKey)).toBe(3);
+      expect(await analyticsService.clearCache(testPublicKey)).toBe(0);
+    });
   });
 
-  describe("Scheduled Email Exports", () => {
-    it("should allow scheduling an export and trigger email", async () => {
-      const schedule = analyticsService.scheduleExport(
-        testPublicKey,
-        "user@example.com",
-        "daily"
+  describe("LRU eviction", () => {
+    it("should evict the least recently used entries beyond the max size", async () => {
+      const accountCount = 600;
+      const accounts = Array.from({ length: accountCount }, (_, i) =>
+        `GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJLVXKJ46ZGFWTTNQNXNHTJX${String(i).padStart(2, "0")}`
       );
 
-      expect(schedule).toEqual(expect.objectContaining({
-        publicKey: testPublicKey,
-        email: "user@example.com",
-        frequency: "daily"
-      }));
+      stellarService.getPayments.mockResolvedValue([]);
 
-      const retrieved = analyticsService.getExportSchedule(testPublicKey);
-      expect(retrieved).toEqual(schedule);
+      for (const publicKey of accounts) {
+        await analyticsService.getSummary(publicKey);
+      }
+
+      await analyticsService.getSummary(accounts[0]);
+      await analyticsService.getSummary("GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJLVXKJ46ZGFWTTNQNXNHTJXZZ");
+
+      const callsAfterPopulate = stellarService.getPayments.mock.calls.length;
+      await analyticsService.getSummary(accounts[0]);
+      expect(stellarService.getPayments).toHaveBeenCalledTimes(callsAfterPopulate);
+
+      await analyticsService.getSummary(accounts[1]);
+      expect(stellarService.getPayments).toHaveBeenCalledTimes(callsAfterPopulate + 1);
     });
   });
 
-  describe("Top Tippers Leaderboard", () => {
-    it("should aggregate and rank top tippers", () => {
-      const tipsService = require("../src/services/tipsService");
-      // Record some mock tips
-      tipsService.recordTip({
-        senderPublicKey: "GBB11111111111111111111111111111111111111111111111111111111",
-        creatorPublicKey: testPublicKey,
-        amount: "10.5",
-      });
-      tipsService.recordTip({
-        senderPublicKey: "GBB11111111111111111111111111111111111111111111111111111111",
-        creatorPublicKey: testPublicKey,
-        amount: "5.5",
-      });
-      tipsService.recordTip({
-        senderPublicKey: "GBB22222222222222222222222222222222222222222222222222222222",
-        creatorPublicKey: testPublicKey,
-        amount: "25.0",
+  describe("admin cache invalidation endpoint", () => {
+    let app;
+    const endpointKey = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJLVXKJ46ZGFWTTNQNXNHTJXW2";
+
+    function authHeaderFor(publicKey) {
+      const token = jwt.sign({ publicKey }, JWT_SECRET, { expiresIn: "1h" });
+      return `Bearer ${token}`;
+    }
+
+    beforeAll(() => {
+      app = require("../src/server");
+    });
+
+    it("returns 401 without a JWT", async () => {
+      const res = await request(app).delete(`/api/analytics/cache/${testPublicKey}`);
+      expect(res.status).toBe(401);
+    });
+
+    it("returns 403 for a non-admin authenticated account", async () => {
+      process.env.ADMIN_PUBLIC_KEYS = "GBUQWP3BOUZX34ULNQG23RQ6F4BWFIYGJ2DN5ZKQYTROZXNUAAOXWS7";
+      const res = await request(app)
+        .delete(`/api/analytics/cache/${endpointKey}`)
+        .set("Authorization", authHeaderFor(endpointKey));
+      expect(res.status).toBe(403);
+    });
+
+    it("force-invalidates the cache for an admin account", async () => {
+      process.env.ADMIN_PUBLIC_KEYS = endpointKey;
+      stellarService.getPayments.mockResolvedValue(mockPayments);
+
+      await analyticsService.getSummary(endpointKey);
+      expect(stellarService.getPayments).toHaveBeenCalledTimes(1);
+
+      await analyticsService.getSummary(endpointKey);
+      expect(stellarService.getPayments).toHaveBeenCalledTimes(1);
+
+      const res = await request(app)
+        .delete(`/api/analytics/cache/${endpointKey}`)
+        .set("Authorization", authHeaderFor(endpointKey));
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        success: true,
+        data: { publicKey: endpointKey, invalidated: 1 },
       });
 
-      const leaderboard = tipsService.getTopTippers(testPublicKey, 5);
-      expect(leaderboard).toHaveLength(2);
-      expect(leaderboard[0].senderPublicKey).toBe("GBB22222222222222222222222222222222222222222222222222222222");
-      expect(parseFloat(leaderboard[0].totalAmount)).toBe(25.0);
-      expect(leaderboard[1].senderPublicKey).toBe("GBB11111111111111111111111111111111111111111111111111111111");
-      expect(parseFloat(leaderboard[1].totalAmount)).toBe(16.0);
+      await analyticsService.getSummary(endpointKey);
+      expect(stellarService.getPayments).toHaveBeenCalledTimes(2);
     });
+
+    it("returns 403 when no admin accounts are configured", async () => {
+      delete process.env.ADMIN_PUBLIC_KEYS;
+      const res = await request(app)
+        .delete(`/api/analytics/cache/${endpointKey}`)
+        .set("Authorization", authHeaderFor(endpointKey));
+      expect(res.status).toBe(403);
+    });
+  });
+});
+
+describe("Analytics Service Cache Archiving (#1210)", () => {
+  beforeEach(() => {
+    // The sweep interval is created at module load, i.e. before fake timers are
+    // installed, so re-arm it here to make it observable by the fake clock.
+    stopCacheSweep();
+    clearAnalyticsCache();
+    jest.useFakeTimers();
+    startCacheSweep();
+  });
+
+  afterEach(() => {
+    stopCacheSweep();
+    jest.useRealTimers();
+  });
+
+  it("evicts entries older than 1 hour during sweep and logs eviction count", () => {
+    const logSpy = jest
+      .spyOn(loggerModule, "info")
+      .mockImplementation(() => {});
+
+    // Set an entry with current timestamp
+    setCachedAnalytics("G_TEST_USER_1", { volume: 100 });
+
+    expect(getCachedAnalytics("G_TEST_USER_1")).toEqual({ volume: 100 });
+
+    // Advance time past 1 hour (e.g., 61 minutes)
+    jest.advanceTimersByTime(61 * 60 * 1000);
+
+    // Trigger the 10-minute interval sweep by advancing timer or calling sweep logic
+    // We advance by SWEEP_INTERVAL_MS (10 mins) or trigger interval tick
+    jest.advanceTimersByTime(10 * 60 * 1000);
+
+    // Verify entry has been evicted
+    expect(getCachedAnalytics("G_TEST_USER_1")).toBeNull();
+    expect(logSpy).toHaveBeenCalledWith("Cache sweep: evicted 1 entries");
+
+    logSpy.mockRestore();
+  });
+
+  it("stops cache sweep correctly when stopCacheSweep is called", () => {
+    const clearIntervalSpy = jest.spyOn(global, "clearInterval");
+    stopCacheSweep();
+    expect(clearIntervalSpy).toHaveBeenCalled();
+    clearIntervalSpy.mockRestore();
   });
 });

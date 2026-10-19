@@ -3,19 +3,16 @@
  * Trading form component for placing market and limit orders on Stellar DEX.
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Asset } from "@stellar/stellar-sdk";
 import {
   buildSellOfferTransaction,
   buildBuyOfferTransaction,
-  buildPathPaymentStrictSendTransaction,
-  fetchStrictSendQuote,
+  buildPathPaymentTransaction,
   submitTransaction,
-  NETWORK_PASSPHRASE,
-  type StrictSendQuote,
+  getNetworkPassphrase,
 } from "@/lib/stellar";
-import { formatAsset } from "@/utils/format";
-import { SwapIcon } from "@/components/icons";
+import { useTranslation } from "@/contexts/I18nContext";
 
 interface TradeFormProps {
   publicKey: string;
@@ -24,105 +21,32 @@ interface TradeFormProps {
   onSuccess: (message: string) => void;
 }
 
-const USDC_ISSUER =
-  process.env.NEXT_PUBLIC_USDC_ISSUER || "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
-
-const getAsset = (assetType: "XLM" | "USDC"): Asset =>
-  assetType === "XLM" ? Asset.native() : new Asset("USDC", USDC_ISSUER);
-
-const SLIPPAGE_PRESETS = ["0.1", "0.5", "1"];
-const DEFAULT_SLIPPAGE = "0.5";
-const MAX_SLIPPAGE_PERCENT = 50;
-const QUOTE_DEBOUNCE_MS = 400;
-
-/**
- * The least the trade may return before it is rejected on-chain: the quoted
- * destination amount reduced by the tolerance the user accepted.
- */
-function applySlippage(destinationAmount: string, slippagePercent: number): string {
-  const quoted = parseFloat(destinationAmount);
-  if (!Number.isFinite(quoted)) return "0";
-  return Math.max(0, quoted * (1 - slippagePercent / 100)).toFixed(7);
-}
-
 export default function TradeForm({ publicKey, onTradeComplete, onError, onSuccess }: TradeFormProps) {
+  const { t } = useTranslation();
   const [orderType, setOrderType] = useState<"market" | "limit">("market");
   const [side, setSide] = useState<"buy" | "sell">("buy");
   const [sellingAsset, setSellingAsset] = useState<"XLM" | "USDC">("XLM");
   const [buyingAsset, setBuyingAsset] = useState<"XLM" | "USDC">("USDC");
   const [amount, setAmount] = useState("");
   const [price, setPrice] = useState("");
-  const [slippage, setSlippage] = useState(DEFAULT_SLIPPAGE);
-  const [quote, setQuote] = useState<StrictSendQuote | null>(null);
-  const [quoteError, setQuoteError] = useState<string | null>(null);
-  const [isQuoting, setIsQuoting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
-  const slippagePercent = parseFloat(slippage);
-  const isSlippageValid =
-    Number.isFinite(slippagePercent) &&
-    slippagePercent >= 0 &&
-    slippagePercent <= MAX_SLIPPAGE_PERCENT;
+  const USDC_ISSUER = process.env.NEXT_PUBLIC_USDC_ISSUER || "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 
-  const isTradeablePair = sellingAsset !== buyingAsset;
-  const hasAmount = Boolean(amount) && parseFloat(amount) > 0;
-
-  // Keep a live market quote so the user can see what the tolerance protects
-  // them from before signing. Limit orders carry their own price instead.
-  useEffect(() => {
-    if (orderType !== "market" || !hasAmount || !isTradeablePair) {
-      setQuote(null);
-      setQuoteError(null);
-      setIsQuoting(false);
-      return;
-    }
-
-    let cancelled = false;
-    setIsQuoting(true);
-
-    const timer = setTimeout(async () => {
-      try {
-        const result = await fetchStrictSendQuote(
-          getAsset(sellingAsset),
-          amount,
-          getAsset(buyingAsset)
-        );
-        if (cancelled) return;
-        setQuote(result);
-        setQuoteError(result ? null : "No trade path found for this pair right now.");
-      } catch {
-        if (cancelled) return;
-        setQuote(null);
-        setQuoteError("Could not fetch a price quote.");
-      } finally {
-        if (!cancelled) setIsQuoting(false);
-      }
-    }, QUOTE_DEBOUNCE_MS);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [orderType, amount, hasAmount, isTradeablePair, sellingAsset, buyingAsset]);
-
-  const minimumReceived =
-    quote && isSlippageValid ? applySlippage(quote.destinationAmount, slippagePercent) : null;
+  const getAsset = (assetType: "XLM" | "USDC"): Asset => {
+    return assetType === "XLM" ? Asset.native() : new Asset("USDC", USDC_ISSUER);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (!amount || (orderType === "limit" && !price)) {
-      onError("Please fill in all required fields");
+      onError(t("tradeForm.fillRequiredFields"));
       return;
     }
 
     if (sellingAsset === buyingAsset) {
-      onError("Cannot trade the same asset");
-      return;
-    }
-
-    if (orderType === "market" && !isSlippageValid) {
-      onError(`Slippage tolerance must be between 0 and ${MAX_SLIPPAGE_PERCENT}%`);
+      onError(t("tradeForm.sameAssetError"));
       return;
     }
 
@@ -134,24 +58,15 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
       const buyAsset = getAsset(buyingAsset);
 
       if (orderType === "market") {
-        // Market order: strict-send path payment, re-quoted at submit time so
-        // the destination minimum reflects the current book.
-        const liveQuote = await fetchStrictSendQuote(sellAsset, amount, buyAsset);
-        if (!liveQuote) {
-          throw new Error("No trade path available for this asset pair.");
-        }
-
-        setQuote(liveQuote);
-        setQuoteError(null);
-
-        transaction = await buildPathPaymentStrictSendTransaction({
+        // Market order using path payment
+        transaction = await buildPathPaymentTransaction({
           fromPublicKey: publicKey,
           toPublicKey: publicKey, // Self-transfer for path payment
           sendAsset: sellAsset,
-          sendAmount: amount,
+          sendMax: amount,
           destAsset: buyAsset,
-          destMin: applySlippage(liveQuote.destinationAmount, slippagePercent),
-          path: liveQuote.path,
+          destAmount: price || amount, // For market orders, this is the amount we want to receive
+          path: [],
         });
 
       } else {
@@ -177,32 +92,30 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
 
       // Sign with Freighter
       const { signTransaction } = await import("@stellar/freighter-api");
-      const signed = await signTransaction(transaction.toXDR(), {
-        networkPassphrase: NETWORK_PASSPHRASE,
+      const signedXDR = await signTransaction(transaction.toXDR(), {
+        networkPassphrase: getNetworkPassphrase(),
       });
-      if (signed.error) {
-        throw new Error(signed.error.message || "Transaction signing failed");
-      }
 
       // Submit transaction
-      const result = await submitTransaction(signed.signedTxXdr);
-      
+      const result = await submitTransaction(signedXDR);
+
       onSuccess(
-        orderType === "market" 
-          ? "Market order executed successfully!" 
-          : `${side === "sell" ? "Sell" : "Buy"} order placed successfully!`
+        orderType === "market"
+          ? t("tradeForm.marketOrderSuccess")
+          : side === "sell"
+            ? t("tradeForm.sellOrderSuccess")
+            : t("tradeForm.buyOrderSuccess")
       );
-      
+
       onTradeComplete();
-      
+
       // Reset form
       setAmount("");
       setPrice("");
-      setQuote(null);
 
     } catch (error) {
       console.error("Trade failed:", error);
-      onError(error instanceof Error ? error.message : "Trade failed");
+      onError(error instanceof Error ? error.message : t("tradeForm.tradeFailed"));
     } finally {
       setIsLoading(false);
     }
@@ -228,7 +141,7 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
                 : "text-slate-400 hover:text-white"
             }`}
           >
-            Market Order
+            {t("tradeForm.marketOrderType")}
           </button>
           <button
             type="button"
@@ -239,7 +152,7 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
                 : "text-slate-400 hover:text-white"
             }`}
           >
-            Limit Order
+            {t("tradeForm.limitOrderType")}
           </button>
         </div>
 
@@ -247,7 +160,7 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
         <div className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-slate-300 mb-2">
-              You Pay
+              {t("tradeForm.youPay")}
             </label>
             <div className="flex gap-2">
               <select
@@ -277,13 +190,15 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
               onClick={swapAssets}
               className="p-2 rounded-lg bg-stellar-500/20 hover:bg-stellar-500/30 transition-colors"
             >
-              <SwapIcon className="w-5 h-5 text-stellar-400" />
+              <svg className="w-5 h-5 text-stellar-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+              </svg>
             </button>
           </div>
 
           <div>
             <label className="block text-sm font-medium text-slate-300 mb-2">
-              You Receive
+              {t("tradeForm.youReceive")}
             </label>
             <div className="flex gap-2">
               <select
@@ -301,99 +216,17 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
                   min="0"
                   value={price}
                   onChange={(e) => setPrice(e.target.value)}
-                  placeholder="Price"
+                  placeholder={t("tradeForm.pricePlaceholder")}
                   className="flex-1 px-3 py-2 bg-cosmos-800 border border-stellar-500/20 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-stellar-400"
                 />
               ) : (
-                <div className="flex-1 px-3 py-2 bg-cosmos-800 border border-stellar-500/20 rounded-lg text-slate-400">
-                  Market Price
+                <div className="flex-1 px-3 py-2 bg-cosmos-800 border border-stellar-500/20 rounded-lg text-slate-500">
+                  {t("tradeForm.marketPrice")}
                 </div>
               )}
             </div>
           </div>
         </div>
-
-        {/* Slippage tolerance — market orders only (#619) */}
-        {orderType === "market" && (
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <label
-                htmlFor="slippage-tolerance"
-                className="block text-sm font-medium text-slate-300"
-              >
-                Slippage tolerance
-              </label>
-              <span className="text-xs text-slate-500">
-                Max price move you accept before the trade fails
-              </span>
-            </div>
-
-            <div className="flex gap-2">
-              {SLIPPAGE_PRESETS.map((preset) => (
-                <button
-                  key={preset}
-                  type="button"
-                  onClick={() => setSlippage(preset)}
-                  aria-pressed={slippage === preset}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                    slippage === preset
-                      ? "bg-stellar-500 text-white"
-                      : "bg-cosmos-800 text-slate-400 hover:text-white"
-                  }`}
-                >
-                  {preset}%
-                </button>
-              ))}
-              <div className="relative flex-1">
-                <input
-                  id="slippage-tolerance"
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  max={MAX_SLIPPAGE_PERCENT}
-                  value={slippage}
-                  onChange={(e) => setSlippage(e.target.value)}
-                  placeholder="0.5"
-                  className="w-full px-3 py-2 pr-7 bg-cosmos-800 border border-stellar-500/20 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-stellar-400"
-                />
-                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500">
-                  %
-                </span>
-              </div>
-            </div>
-
-            {!isSlippageValid && (
-              <p className="text-xs text-red-400">
-                Enter a slippage tolerance between 0 and {MAX_SLIPPAGE_PERCENT}%.
-              </p>
-            )}
-
-            {isQuoting && <p className="text-xs text-slate-500">Fetching best price…</p>}
-
-            {!isQuoting && quoteError && (
-              <p className="text-xs text-amber-400">{quoteError}</p>
-            )}
-
-            {!isQuoting && quote && (
-              <div className="rounded-lg bg-cosmos-800/60 border border-stellar-500/10 px-3 py-2 text-xs space-y-1">
-                <div className="flex justify-between text-slate-400">
-                  <span>Expected to receive</span>
-                  <span className="text-slate-200">
-                    {formatAsset(quote.destinationAmount, buyingAsset)}
-                  </span>
-                </div>
-                {minimumReceived && (
-                  <div className="flex justify-between text-slate-400">
-                    <span>Minimum received</span>
-                    <span className="text-white font-medium">
-                      {formatAsset(minimumReceived, buyingAsset)}
-                    </span>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
 
         {/* Limit Order Specific Options */}
         {orderType === "limit" && (
@@ -408,7 +241,7 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
                     : "text-slate-400 hover:text-white"
                 }`}
               >
-                Buy Order
+                {t("tradeForm.buyOrderSide")}
               </button>
               <button
                 type="button"
@@ -419,7 +252,7 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
                     : "text-slate-400 hover:text-white"
                 }`}
               >
-                Sell Order
+                {t("tradeForm.sellOrderSide")}
               </button>
             </div>
           </div>
@@ -428,15 +261,16 @@ export default function TradeForm({ publicKey, onTradeComplete, onError, onSucce
         {/* Submit Button */}
         <button
           type="submit"
-          disabled={
-            isLoading ||
-            !amount ||
-            (orderType === "limit" && !price) ||
-            (orderType === "market" && !isSlippageValid)
-          }
+          disabled={isLoading || !amount || (orderType === "limit" && !price)}
           className="w-full btn-primary"
         >
-          {isLoading ? "Processing..." : orderType === "market" ? "Execute Market Order" : `${side === "buy" ? "Place Buy" : "Place Sell"} Order`}
+          {isLoading
+            ? t("tradeForm.processing")
+            : orderType === "market"
+              ? t("tradeForm.executeMarketOrder")
+              : side === "buy"
+                ? t("tradeForm.placeBuyOrder")
+                : t("tradeForm.placeSellOrder")}
         </button>
       </form>
     </div>

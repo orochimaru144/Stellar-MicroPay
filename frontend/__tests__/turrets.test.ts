@@ -1,236 +1,324 @@
-/**
- * Unit tests for lib/turrets.ts (#522).
- *
- * Covers:
- * - Each helper calls apiFetch with the correct URL, method, and body
- * - Network / API errors are surfaced (not swallowed)
- */
-
-// Mock the api module before importing turrets so turrets picks up the mock.
-jest.mock("@/lib/api", () => ({
-  apiFetch: jest.fn(),
-  ApiError: class ApiError extends Error {
-    status: number;
-    body: unknown;
-    constructor(message: string, status: number, body?: unknown) {
-      super(message);
-      this.name = "ApiError";
-      this.status = status;
-      this.body = body;
-    }
-  },
-}));
-
-import { apiFetch } from "@/lib/api";
 import {
+  cancelTurretsFunction,
+  createDcaAutomation,
+  createScheduledDcaPayment,
+  createStopLossAutomation,
   createTurretsChallenge,
   deployTurretsFunction,
+  getTurretSignerAddress,
   getTurretsHistory,
   listTurretsFunctions,
   pauseTurretsFunction,
   resumeTurretsFunction,
+  type TurretsAutomationResponse,
   type TurretsDeployment,
   type TurretsExecutionHistory,
-} from "@/lib/turrets";
+} from "../lib/turrets";
 
-const mockApiFetch = apiFetch as jest.MockedFunction<typeof apiFetch>;
+const OWNER = "GBRPYHIL2CI3FNIDTANYQ7BACEGIA63POASRMHWDHMV65QHJTWCTBYOO";
+const SIGNER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
-const MOCK_DEPLOYMENT: TurretsDeployment = {
-  id: "dep-1",
-  ownerPublicKey: "GABC123",
+const deployment: TurretsDeployment & { signedChallengeXDR: string | null } = {
+  id: "deployment-123",
+  ownerPublicKey: OWNER,
   type: "dca",
   status: "active",
-  config: { amount: 10 },
-  deploymentHash: "hash-abc",
-  createdAt: "2024-01-01T00:00:00Z",
-  nextRunAt: null,
+  config: {
+    intervalMinutes: 60,
+    amountQuote: 10,
+    quoteAssetCode: "XLM",
+    quoteAssetIssuer: null,
+  },
+  deploymentHash: "deployment-hash",
+  signedChallengeXDR: null,
+  createdAt: "2026-01-02T03:04:05.000Z",
+  nextRunAt: "2026-01-02T04:04:05.000Z",
   lastExecutedAt: null,
   lastCheckedAt: null,
   lastObservedPriceUsd: null,
   lastError: null,
 };
 
-describe("turrets API helpers", () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
+const automation: TurretsAutomationResponse = {
+  ...deployment,
+  turretSignerAddress: SIGNER,
+};
+
+const history: TurretsExecutionHistory[] = [
+  {
+    id: "history-123",
+    deploymentId: deployment.id,
+    status: "created",
+    message: "txFunction deployed via dca wizard",
+    result: null,
+    createdAt: "2026-01-02T03:04:05.000Z",
+  },
+];
+
+const originalFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+
+function response(body: unknown, options: { ok?: boolean; status?: number } = {}) {
+  return {
+    ok: options.ok ?? true,
+    status: options.status ?? 200,
+    json: jest.fn().mockResolvedValue(body),
+  } as unknown as Response;
+}
+
+function fetchMock() {
+  return globalThis.fetch as jest.MockedFunction<typeof fetch>;
+}
+
+function queueSuccess(data: unknown, options: { status?: number } = {}) {
+  fetchMock().mockResolvedValueOnce(
+    response({ success: true, data }, { status: options.status }),
+  );
+}
+
+beforeEach(() => {
+  delete process.env.NEXT_PUBLIC_API_URL;
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    writable: true,
+    value: jest.fn().mockRejectedValue(new Error("Unexpected network request")),
   });
+});
 
-  // ── createTurretsChallenge ─────────────────────────────────────────────────
+afterEach(() => {
+  if (originalApiUrl === undefined) {
+    delete process.env.NEXT_PUBLIC_API_URL;
+  } else {
+    process.env.NEXT_PUBLIC_API_URL = originalApiUrl;
+  }
 
-  describe("createTurretsChallenge", () => {
-    it("calls POST /api/turrets/challenge with the supplied params", async () => {
-      const response = {
-        challengeXDR: "xdr-payload",
-        deploymentHash: "hash-abc",
-        normalizedConfig: { amount: 10 },
-        networkPassphrase: "Test SDF Network ; September 2015",
-      };
-      mockApiFetch.mockResolvedValueOnce(response);
+  if (originalFetch) {
+    Object.defineProperty(globalThis, "fetch", originalFetch);
+  } else {
+    Reflect.deleteProperty(globalThis, "fetch");
+  }
+});
 
-      const params = {
-        ownerPublicKey: "GABC",
-        type: "dca" as const,
-        config: { amount: 10 },
-      };
-      const result = await createTurretsChallenge(params);
+describe("Turrets API requests", () => {
+  it("posts a signing challenge and returns the backend data", async () => {
+    const params = {
+      ownerPublicKey: OWNER,
+      type: "dca" as const,
+      config: { intervalMinutes: 60, amountQuote: 10 },
+    };
+    const challenge = {
+      challengeXDR: "challenge-xdr",
+      deploymentHash: "deployment-hash",
+      normalizedConfig: {
+        ...params.config,
+        quoteAssetCode: "USDC",
+        quoteAssetIssuer: null,
+      },
+      networkPassphrase: "Test SDF Network ; September 2015",
+    };
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test/";
+    queueSuccess(challenge);
 
-      expect(mockApiFetch).toHaveBeenCalledWith("/api/turrets/challenge", {
-        method: "POST",
-        body: JSON.stringify(params),
-      });
-      expect(result).toEqual(response);
-    });
-
-    it("surfaces network errors — does not swallow them", async () => {
-      mockApiFetch.mockRejectedValueOnce(new Error("Network error"));
-
-      await expect(
-        createTurretsChallenge({ ownerPublicKey: "GABC", type: "dca", config: {} }),
-      ).rejects.toThrow("Network error");
-    });
-
-    it("surfaces API errors with their status code", async () => {
-      const apiErr = { name: "ApiError", message: "Unauthorized", status: 401 };
-      mockApiFetch.mockRejectedValueOnce(Object.assign(new Error("Unauthorized"), apiErr));
-
-      await expect(
-        createTurretsChallenge({ ownerPublicKey: "GABC", type: "dca", config: {} }),
-      ).rejects.toMatchObject({ message: "Unauthorized" });
-    });
-  });
-
-  // ── deployTurretsFunction ──────────────────────────────────────────────────
-
-  describe("deployTurretsFunction", () => {
-    it("calls POST /api/turrets/deploy and returns the deployment", async () => {
-      mockApiFetch.mockResolvedValueOnce(MOCK_DEPLOYMENT);
-
-      const params = {
-        ownerPublicKey: "GABC",
-        type: "dca" as const,
-        config: { amount: 10 },
-        deploymentHash: "hash-abc",
-        signedChallengeXDR: "signed-xdr",
-      };
-      const result = await deployTurretsFunction(params);
-
-      expect(mockApiFetch).toHaveBeenCalledWith("/api/turrets/deploy", {
-        method: "POST",
-        body: JSON.stringify(params),
-      });
-      expect(result).toEqual(MOCK_DEPLOYMENT);
-    });
-
-    it("surfaces errors from the API", async () => {
-      mockApiFetch.mockRejectedValueOnce(new Error("Bad Gateway"));
-
-      await expect(
-        deployTurretsFunction({
-          ownerPublicKey: "GABC",
-          type: "stop_loss",
-          config: {},
-          deploymentHash: "h",
-          signedChallengeXDR: "xdr",
-        }),
-      ).rejects.toThrow("Bad Gateway");
-    });
-  });
-
-  // ── listTurretsFunctions ───────────────────────────────────────────────────
-
-  describe("listTurretsFunctions", () => {
-    it("calls GET with URL-encoded owner public key", async () => {
-      mockApiFetch.mockResolvedValueOnce([MOCK_DEPLOYMENT]);
-      const pk = "GABC+DEF/GHI";
-
-      const result = await listTurretsFunctions(pk);
-
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        `/api/turrets?ownerPublicKey=${encodeURIComponent(pk)}`,
-      );
-      expect(result).toEqual([MOCK_DEPLOYMENT]);
-    });
-
-    it("returns an empty array when no deployments exist", async () => {
-      mockApiFetch.mockResolvedValueOnce([]);
-
-      const result = await listTurretsFunctions("GABC");
-      expect(result).toEqual([]);
-    });
-
-    it("handles null or non-array responses gracefully by returning empty array", async () => {
-      mockApiFetch.mockResolvedValueOnce(null as unknown as TurretsDeployment[]);
-
-      const result = await listTurretsFunctions("GABC");
-      expect(result).toEqual([]);
-    });
-
-    it("surfaces API errors", async () => {
-      mockApiFetch.mockRejectedValueOnce(new Error("500 Internal Server Error"));
-      await expect(listTurretsFunctions("GABC")).rejects.toThrow("500 Internal Server Error");
+    await expect(createTurretsChallenge(params)).resolves.toEqual(challenge);
+    expect(fetchMock()).toHaveBeenCalledWith("https://api.example.test/api/turrets/challenge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
     });
   });
 
-  // ── getTurretsHistory ──────────────────────────────────────────────────────
+  it("posts the deployment challenge fields and returns the deployment", async () => {
+    const params = {
+      ownerPublicKey: OWNER,
+      type: "dca" as const,
+      config: { intervalMinutes: 60, amountQuote: 10 },
+      deploymentHash: "deployment-hash",
+      signedChallengeXDR: "signed-challenge-xdr",
+    };
+    queueSuccess(deployment, { status: 201 });
 
-  describe("getTurretsHistory", () => {
-    it("calls GET /api/turrets/:id/history with encoded id", async () => {
-      const history: TurretsExecutionHistory[] = [
-        {
-          id: "h1",
-          deploymentId: "dep-1",
-          status: "success",
-          message: "ran ok",
-          result: null,
-          createdAt: "2024-01-01T00:00:00Z",
-        },
-      ];
-      mockApiFetch.mockResolvedValueOnce(history);
-
-      const result = await getTurretsHistory("dep-1");
-
-      expect(mockApiFetch).toHaveBeenCalledWith("/api/turrets/dep-1/history");
-      expect(result).toEqual(history);
-    });
-
-    it("URL-encodes the id", async () => {
-      mockApiFetch.mockResolvedValueOnce([]);
-
-      await getTurretsHistory("dep/1 2");
-      expect(mockApiFetch).toHaveBeenCalledWith(
-        `/api/turrets/${encodeURIComponent("dep/1 2")}/history`,
-      );
+    await expect(deployTurretsFunction(params)).resolves.toEqual(deployment);
+    expect(fetchMock()).toHaveBeenCalledWith("/api/turrets/deploy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
     });
   });
 
-  // ── pauseTurretsFunction ───────────────────────────────────────────────────
+  it("posts scheduled payment fields including the nullable optional issuer", async () => {
+    const params = {
+      ownerPublicKey: OWNER,
+      recipient: SIGNER,
+      amount: 5,
+      asset: "XLM",
+      assetIssuer: null,
+      frequency: "weekly" as const,
+    };
+    const scheduledResponse: TurretsAutomationResponse = {
+      ...automation,
+      config: {
+        intervalMinutes: 60,
+        amountQuote: 10,
+        quoteAssetCode: "USDC",
+        quoteAssetIssuer: null,
+      },
+    };
+    queueSuccess(scheduledResponse, { status: 201 });
 
-  describe("pauseTurretsFunction", () => {
-    it("calls POST /api/turrets/:id/pause and returns updated deployment", async () => {
-      const paused = { ...MOCK_DEPLOYMENT, status: "paused" as const };
-      mockApiFetch.mockResolvedValueOnce(paused);
-
-      const result = await pauseTurretsFunction("dep-1");
-
-      expect(mockApiFetch).toHaveBeenCalledWith("/api/turrets/dep-1/pause", {
-        method: "POST",
-      });
-      expect(result.status).toBe("paused");
+    await expect(createScheduledDcaPayment(params)).resolves.toEqual(scheduledResponse);
+    expect(fetchMock()).toHaveBeenCalledWith("/api/turrets/dca", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
     });
   });
 
-  // ── resumeTurretsFunction ──────────────────────────────────────────────────
+  it("lists deployments using an encoded owner query parameter", async () => {
+    const ownerPublicKey = "G OWNER/?";
+    queueSuccess([deployment]);
 
-  describe("resumeTurretsFunction", () => {
-    it("calls POST /api/turrets/:id/resume and returns active deployment", async () => {
-      mockApiFetch.mockResolvedValueOnce({ ...MOCK_DEPLOYMENT, status: "active" });
+    await expect(listTurretsFunctions(ownerPublicKey)).resolves.toEqual([deployment]);
+    expect(fetchMock()).toHaveBeenCalledWith(
+      `/api/turrets?ownerPublicKey=${encodeURIComponent(ownerPublicKey)}`,
+    );
+  });
 
-      const result = await resumeTurretsFunction("dep-1");
+  it("posts DCA automation fields and preserves the signer in the response", async () => {
+    const params = {
+      ownerPublicKey: OWNER,
+      intervalMinutes: 60,
+      amountQuote: 10,
+    };
+    queueSuccess(automation, { status: 201 });
 
-      expect(mockApiFetch).toHaveBeenCalledWith("/api/turrets/dep-1/resume", {
-        method: "POST",
-      });
-      expect(result.status).toBe("active");
+    await expect(createDcaAutomation(params)).resolves.toEqual(automation);
+    expect(fetchMock()).toHaveBeenCalledWith("/api/turrets/dca", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
     });
+  });
+
+  it("posts stop-loss fields including configured optional values", async () => {
+    const params = {
+      ownerPublicKey: OWNER,
+      thresholdPrice: 0.1,
+      amountSell: 100,
+      sellAssetCode: "USDC",
+      sellAssetIssuer: SIGNER,
+      cooldownMinutes: 30,
+    };
+    const stopLossDeployment: TurretsAutomationResponse = {
+      ...automation,
+      type: "stop_loss",
+      config: params,
+    };
+    queueSuccess(stopLossDeployment, { status: 201 });
+
+    await expect(createStopLossAutomation(params)).resolves.toEqual(stopLossDeployment);
+    expect(fetchMock()).toHaveBeenCalledWith("/api/turrets/stop-loss", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+  });
+
+  it("extracts the signer address from the signer endpoint response", async () => {
+    queueSuccess({ turretSignerAddress: SIGNER });
+
+    await expect(getTurretSignerAddress()).resolves.toBe(SIGNER);
+    expect(fetchMock()).toHaveBeenCalledWith("/api/turrets/signer");
+  });
+
+  it("loads execution history for an encoded deployment id", async () => {
+    const id = "deployment/with space";
+    queueSuccess(history);
+
+    await expect(getTurretsHistory(id)).resolves.toEqual(history);
+    expect(fetchMock()).toHaveBeenCalledWith(
+      `/api/turrets/${encodeURIComponent(id)}/history`,
+    );
+  });
+
+  it("pauses a deployment with PATCH", async () => {
+    const paused = { ...deployment, status: "paused" as const };
+    queueSuccess(paused);
+
+    await expect(pauseTurretsFunction(deployment.id)).resolves.toEqual(paused);
+    expect(fetchMock()).toHaveBeenCalledWith(`/api/turrets/${deployment.id}/pause`, {
+      method: "PATCH",
+    });
+  });
+
+  it("resumes a deployment with POST", async () => {
+    queueSuccess(deployment);
+
+    await expect(resumeTurretsFunction(deployment.id)).resolves.toEqual(deployment);
+    expect(fetchMock()).toHaveBeenCalledWith(`/api/turrets/${deployment.id}/resume`, {
+      method: "POST",
+    });
+  });
+
+  it("cancels a deployment with DELETE", async () => {
+    const cancelled = {
+      id: deployment.id,
+      status: "cancelled",
+      cancelledAt: "2026-01-02T03:04:05.000Z",
+    };
+    queueSuccess(cancelled);
+
+    await expect(cancelTurretsFunction(deployment.id)).resolves.toEqual(cancelled);
+    expect(fetchMock()).toHaveBeenCalledWith(`/api/turrets/${deployment.id}`, {
+      method: "DELETE",
+    });
+  });
+});
+
+describe("Turrets API errors", () => {
+  it.each([
+    [400, "Invalid configuration"],
+    [404, "txFunction not found"],
+    [429, "Too many requests"],
+  ])("uses the backend error message for HTTP %i responses", async (status, message) => {
+    fetchMock().mockResolvedValueOnce(
+      response({ error: message }, { ok: false, status }),
+    );
+
+    await expect(getTurretsHistory("missing-id")).rejects.toThrow(message);
+  });
+
+  it("uses the error field when the API reports failure in a successful HTTP response", async () => {
+    fetchMock().mockResolvedValueOnce(
+      response({ success: false, error: "Challenge rejected" }),
+    );
+
+    await expect(getTurretSignerAddress()).rejects.toThrow("Challenge rejected");
+  });
+
+  it("uses the generic error when the response body is not valid JSON", async () => {
+    fetchMock().mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: jest.fn().mockRejectedValue(new SyntaxError("Unexpected token")),
+    } as unknown as Response);
+
+    await expect(listTurretsFunctions(OWNER)).rejects.toThrow(
+      "Turrets API request failed",
+    );
+  });
+
+  it("uses the generic error when the response has no success flag or error", async () => {
+    fetchMock().mockResolvedValueOnce(response({ data: [] }));
+
+    await expect(listTurretsFunctions(OWNER)).rejects.toThrow(
+      "Turrets API request failed",
+    );
+  });
+
+  it("propagates fetch network failures unchanged", async () => {
+    const networkError = new TypeError("Failed to fetch");
+    fetchMock().mockRejectedValueOnce(networkError);
+
+    await expect(getTurretSignerAddress()).rejects.toBe(networkError);
   });
 });

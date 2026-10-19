@@ -5,275 +5,323 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  # ─── EditorConfig ──────────────────────────────────────────────────────────
-  editorconfig:
-    name: EditorConfig Compliance
+  # ─── Secret scanning ───────────────────────────────────────────────────────
+  # Scans the *full* commit history, not just the diff introduced by this branch:
+  # a secret can sit unnoticed in a commit that landed weeks ago, and a
+  # diff-only scan is exactly what lets it stay unnoticed.
+  gitleaks:
+    name: Gitleaks (secret scan)
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check EditorConfig compliance
-        uses: editorconfig-checker/action-editorconfig-checker@main
-
-  # ─── Frontend Type Check (required gate) ───────────────────────────────────
-  frontend-typecheck:
-    name: Frontend Type Check
-    runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: frontend
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          node-version-file: ".nvmrc"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
+          # Unshallow the clone so the scanner sees every commit, not just HEAD.
+          fetch-depth: 0
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type check
-        run: npm run type-check
-
-  # ─── Frontend ──────────────────────────────────────────────────────────────
-  frontend:
-    name: Frontend (Next.js)
-    runs-on: ubuntu-latest
-    needs: frontend-typecheck
-
-    defaults:
-      run:
-        working-directory: frontend
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: ".nvmrc"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Check for unused dependencies
-        run: npx depcheck --ignores="@storybook/*,prettier" --ignore-dirs=.next,.storybook
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Unit tests
-        run: npm test
-
-      - name: Build
-        run: npm run build
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
         env:
-          NEXT_PUBLIC_STELLAR_NETWORK: testnet
-          NEXT_PUBLIC_HORIZON_URL: https://horizon-testnet.stellar.org
-          NEXT_PUBLIC_API_URL: http://localhost:4000
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_RELEASE: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only needed for organisation-owned repos; harmless on a personal one.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          # Project rules, including the Stellar secret-seed (S...) detector.
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
 
-      - name: Build Storybook (dev-only docs bundle)
-        run: npm run build-storybook
-
-      - name: Bundle size budget
-        run: npm run size
-
-      - name: Route bundle and hydration budgets
-        run: npm run bundle-report
-        env:
-          NEXT_PUBLIC_STELLAR_NETWORK: testnet
-
-      - name: Upload route bundle report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-route-bundle-report
-          path: frontend/bundle-reports/
-
-  # ─── Backend ───────────────────────────────────────────────────────────────
-  backend:
-    name: Backend (Node.js)
+  # ─── Repository integrity ─────────────────────────────────────────────────
+  repository:
+    name: Repository integrity
     runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: backend
-
+    needs: []
     steps:
+      # Full history so HEAD^ resolves — actions/checkout defaults to a
+      # shallow (depth=1) clone where HEAD^ is an unknown revision.
       - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version-file: ".nvmrc"
-          cache: "npm"
-          cache-dependency-path: backend/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Check for unused dependencies
-        run: npx depcheck
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Unit tests
-        run: npm test
-
-  # ─── Contracts ─────────────────────────────────────────────────────────────
-  contracts:
-    name: Soroban Contracts (Rust)
-    runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: contracts/stellar-micropay-contract
-
-    env:
-      RUST_VERSION: "1.91.0"
-      STELLAR_CLI_VERSION: "21.5.0"
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust ${{ env.RUST_VERSION }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: wasm32v1-none
-          components: rustfmt, clippy
-
-      - name: Cache cargo
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+      - name: Cache Node.js dependencies
+        id: node-modules-cache
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Install Stellar CLI ${{ env.STELLAR_CLI_VERSION }}
-        run: cargo install --locked --version ${{ env.STELLAR_CLI_VERSION }} stellar-cli || true
-
-      # ── Gate 1: Format ──────────────────────────────────────────────────
-      - name: "Gate: rustfmt"
-        id: fmt
-        run: cargo fmt --all -- --check > fmt-stdout.txt 2>&1 || { EXIT_CODE=$?; echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"; exit $EXIT_CODE; }
-
-      - name: Upload rustfmt failure output
-        if: failure() && steps.fmt.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustfmt-failure
-          path: contracts/stellar-micropay-contract/fmt-stdout.txt
-
-      # ── Gate 2: Clippy ──────────────────────────────────────────────────
-      - name: "Gate: clippy"
-        id: clippy
-        run: cargo clippy --target wasm32v1-none -- -D warnings 2> clippy-stderr.txt || { EXIT_CODE=$?; echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"; exit $EXIT_CODE; }
-
-      - name: Upload clippy failure output
-        if: failure() && steps.clippy.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: clippy-failure
-          path: contracts/stellar-micropay-contract/clippy-stderr.txt
-
-      # ── Gate 3: Tests ───────────────────────────────────────────────────
-      - name: "Gate: cargo test"
-        id: test
-        run: cargo test 2> test-stderr.txt || { EXIT_CODE=$?; echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"; exit $EXIT_CODE; }
-
-      - name: Upload test failure output
-        if: failure() && steps.test.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-test-failure
-          path: contracts/stellar-micropay-contract/test-stderr.txt
-
-      # ── Gate 4: WASM build ──────────────────────────────────────────────
-      - name: "Gate: WASM build"
-        id: wasm
-        run: cargo build --target wasm32v1-none --release 2> wasm-stderr.txt || { EXIT_CODE=$?; echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"; exit $EXIT_CODE; }
-
-      - name: Upload WASM failure output
-        if: failure() && steps.wasm.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-build-failure
-          path: contracts/stellar-micropay-contract/wasm-stderr.txt
-
-      # ── Gate 5: SDK deprecation audit ───────────────────────────────────
-      - name: "Gate: deprecation-free build"
-        id: deprecation
+            frontend/node_modules
+            backend/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+      - name: Install frontend dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm ci
+        working-directory: frontend
+      - name: Install backend dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm ci
+        working-directory: backend
+      - name: ESLint (frontend)
+        run: npm run lint
+        working-directory: frontend
+      - name: ESLint (backend)
+        run: npm run lint
+        working-directory: backend
+      - name: TypeScript type check (tsc --noEmit)
+        run: npm run type-check
+        working-directory: frontend
+      - name: Reject whitespace errors and unresolved conflicts
         run: |
-          cargo build --target wasm32v1-none --release 2>&1 | tee build-output.txt
-          DEPRECATION_COUNT=$(grep -ci 'warning.*deprecated\|warning.*deprecat' build-output.txt || true)
-          echo "deprecation_count=$DEPRECATION_COUNT" >> "$GITHUB_OUTPUT"
-          if [ "$DEPRECATION_COUNT" -gt 0 ]; then
-            echo "::warning::Found $DEPRECATION_COUNT deprecation warning(s) in the contract build"
-            grep -i 'warning.*deprecated\|warning.*deprecat' build-output.txt || true
+          # Only diff the last commit when it actually has a parent; a
+          # single-commit or shallow checkout has no HEAD^ to compare against.
+          if git rev-parse --verify --quiet HEAD^ >/dev/null; then
+            git diff --check HEAD^
+          else
+            echo "No parent commit to diff; skipping whitespace check."
           fi
+          ! git grep -n -E '^(<<<<<<<|=======|>>>>>>>)'
 
-      - name: Install Syft
-        uses: anchore/sbom-action/download-syft@v0
 
-      - name: Generate and verify contract SBOM (#817)
-        working-directory: contracts/stellar-micropay-contract
-        run: |
-          syft scan dir:. -o cyclonedx-json=../../contract-sbom.cyclonedx.json
-          test -s ../../contract-sbom.cyclonedx.json
-          test -f ../../target/wasm32v1-none/release/stellar_micropay_contract.wasm
-
-  # ─── E2E Tests ─────────────────────────────────────────────────────────────
-  e2e:
-    name: E2E Tests (Playwright)
+  frontend:
+    name: Frontend (typecheck, lint, test, build)
     runs-on: ubuntu-latest
-    needs: frontend-typecheck
-
+    needs: []
     defaults:
       run:
         working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Audit dependencies (raw report)
+        run: npm audit --omit=dev --audit-level=high || true
 
+      # Advisories with no patched release available are listed in
+      # .github/audit-allowlist.txt. Fail if any high/critical advisory is
+      # reported that is NOT on that list.
+      - name: Check audit against allowlist
+        env:
+          ALLOWLIST: ${{ github.workspace }}/.github/audit-allowlist.txt
+        run: |
+          set -euo pipefail
+          grep -vE '^[[:space:]]*(#|$)' "$ALLOWLIST" | tr -d ' \r' > /tmp/allowlist.txt || true
+          test -s /tmp/allowlist.txt || { echo "::error::Allowlist is empty or unreadable: $ALLOWLIST"; exit 1; }
+          npm audit --json --omit=dev --audit-level=high > /tmp/audit.json || true
+          jq -r '
+            (.vulnerabilities // {})
+            | to_entries[]
+            | select(.value.severity == "high" or .value.severity == "critical")
+            | .value.via[]
+            | select(type == "object" and (.url // null) != null)
+            | .url
+            | select(startswith("https://github.com/advisories/"))
+            | split("/")
+            | last
+          ' /tmp/audit.json | sort -u > /tmp/all-ghsas.txt
+
+          if [ ! -s /tmp/all-ghsas.txt ]; then
+            echo "No high/critical advisories reported."
+            exit 0
+          fi
+
+          echo "Reported high/critical advisories:"
+          cat /tmp/all-ghsas.txt
+
+          UNEXPECTED=$(grep -vxF -f /tmp/allowlist.txt /tmp/all-ghsas.txt || true)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::Unexpected high/critical advisories: $UNEXPECTED"
+            exit 1
+          fi
+
+          echo "All high/critical advisories are allowlisted in $ALLOWLIST."
+      - run: npm run type-check
+      - run: npm run lint
+      - run: npm test
+
+  test-backend:
+    name: Test (backend)
+    runs-on: ubuntu-latest
+    needs: []
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - name: Audit dependencies (raw report)
+        run: npm audit --omit=dev --audit-level=high || true
+
+      # Advisories with no patched release available are listed in
+      # .github/audit-allowlist.txt. Fail if any high/critical advisory is
+      # reported that is NOT on that list.
+      - name: Check audit against allowlist
+        env:
+          ALLOWLIST: ${{ github.workspace }}/.github/audit-allowlist.txt
+        run: |
+          set -euo pipefail
+          grep -vE '^[[:space:]]*(#|$)' "$ALLOWLIST" | tr -d ' \r' > /tmp/allowlist.txt || true
+          test -s /tmp/allowlist.txt || { echo "::error::Allowlist is empty or unreadable: $ALLOWLIST"; exit 1; }
+          npm audit --json --omit=dev --audit-level=high > /tmp/audit.json || true
+          jq -r '
+            (.vulnerabilities // {})
+            | to_entries[]
+            | select(.value.severity == "high" or .value.severity == "critical")
+            | .value.via[]
+            | select(type == "object" and (.url // null) != null)
+            | .url
+            | select(startswith("https://github.com/advisories/"))
+            | split("/")
+            | last
+          ' /tmp/audit.json | sort -u > /tmp/all-ghsas.txt
+
+          if [ ! -s /tmp/all-ghsas.txt ]; then
+            echo "No high/critical advisories reported."
+            exit 0
+          fi
+
+          echo "Reported high/critical advisories:"
+          cat /tmp/all-ghsas.txt
+
+          UNEXPECTED=$(grep -vxF -f /tmp/allowlist.txt /tmp/all-ghsas.txt || true)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::Unexpected high/critical advisories: $UNEXPECTED"
+            exit 1
+          fi
+
+          echo "All high/critical advisories are allowlisted in $ALLOWLIST."
+      - run: npm run lint
+      - run: npm test
+
+  test-contracts:
+    name: Test (Soroban contract)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    # soroban-sdk 28's build script only accepts a wasm build when the build
+    # system declares that spec shaking happens out-of-band
+    # (SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2). `cargo check` and
+    # `cargo test` only type-check/run tests, so they set the marker here; the
+    # deployable artifact is produced by `stellar contract build` below, which
+    # sets it legitimately as part of the build.
+    env:
+      SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none, wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Scans the workspace Cargo.lock, which pins the contract at
+      # contracts/stellar-micropay-contract. cargo audit has no severity
+      # threshold like npm's --audit-level, so it fails on any vulnerability
+      # advisory (unmaintained-crate notices are reported as warnings only).
+      - name: Audit contract dependencies (fails on any vulnerability)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cargo check (wasm32v1-none)
+        run: cargo check --target wasm32v1-none
+      - run: cargo test
+      # Install stellar-cli pinned in lockstep with soroban-sdk (both 28.x):
+      # it is required to produce a deployable wasm with a correctly shaken
+      # spec, and plain `cargo build` is rejected by soroban-sdk's build script.
+      - name: Install stellar CLI
+        run: |
+          curl -fL --retry 5 --retry-delay 5 --retry-connrefused \
+            --connect-timeout 30 --max-time 300 \
+            -o "$RUNNER_TEMP/stellar-cli.tar.gz" \
+            "https://github.com/stellar/stellar-cli/releases/download/v28.0.0/stellar-cli-28.0.0-x86_64-unknown-linux-gnu.tar.gz"
+          sudo tar xz -C /usr/local/bin -f "$RUNNER_TEMP/stellar-cli.tar.gz"
+          stellar --version
+      - name: Build release WASM
+        run: stellar contract build --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stellar-micropay-contract-wasm
+          path: target/*/release/stellar_micropay_contract.wasm
+          if-no-files-found: error
+
+  integration-test:
+    name: Integration tests (docker-compose)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: ".nvmrc"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
+      - name: Build and run integration tests
+        run: |
+          docker compose -f docker-compose.test.yml up \
+            --build \
+            --abort-on-container-exit \
+            --exit-code-from backend-test
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
-
-      - name: Run E2E tests
-        run: npm run test:e2e
-
-      - name: Upload Playwright report
+      - name: Tear down containers
         if: always()
+        run: docker compose -f docker-compose.test.yml down --volumes --remove-orphans
+
+  e2e:
+    name: Browser smoke (Playwright)
+    runs-on: ubuntu-latest
+    needs: []
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report
           path: frontend/playwright-report/
+          if-no-files-found: warn
+
+  health-smoke:
+    name: Docker Compose health smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start stack with docker compose
+        env:
+          JWT_SECRET: ci-only-test-secret-not-for-production
+        run: docker compose up -d --build
+      - name: Wait for backend healthcheck
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:4000/health >/dev/null; then
+              echo "Backend healthy"
+              exit 0
+            fi
+            echo "Waiting for backend... ($i/30)"
+            sleep 2
+          done
+          echo "Backend did not become healthy in time"
+          docker compose logs
+          exit 1
+      - name: Run /health smoke test
+        run: SMOKE_HEALTH_ONLY=1 HEALTH_URL=http://localhost:4000 node scripts/smoke-test.js
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v

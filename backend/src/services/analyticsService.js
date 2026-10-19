@@ -2,94 +2,110 @@
  * src/services/analyticsService.js
  * Business logic for transaction volume analytics.
  * Fetches payment data from Horizon and computes aggregated insights.
- * Includes in-memory caching with 5-minute TTL.
+ * Includes Redis-backed caching with 5-minute TTL (falls back to in-memory),
+ * plus a per-key response cache with 1-hour TTL and periodic sweep (#1210).
  */
 
 "use strict";
 
-const emailService = require("./emailService");
+const cache = require("./cache");
 const stellarService = require("./stellarService");
+const logger = require("../utils/logger");
 
-// ─── Cache Configuration ──────────────────────────────────────────────────────
+// ─── Legacy In-Memory Archive Sweep ──────────────────────────────────────────
+// Entries written directly through the archive helpers at the bottom of this
+// file (rather than through `cache`) are swept periodically so that the Map
+// cannot grow unbounded.
 
-const CACHE_TTL = 60 * 1000; // 60 seconds in milliseconds
-const CACHE_MAX_SIZE = 100; // bounded LRU size
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
-/**
- * Bounded LRU cache with TTL support.
- * Evicts least-recently-used entries when capacity is exceeded.
- */
-class LRUCache {
-  constructor(maxSize, ttl) {
-    this.maxSize = maxSize;
-    this.ttl = ttl;
-    this.store = new Map();
-  }
+// Map structure: key -> { data, timestamp }
+const analyticsCache = new Map();
 
-  get(key) {
-    const entry = this.store.get(key);
-    if (!entry) return undefined;
+function sweepCache() {
+  const now = Date.now();
+  let evictedCount = 0;
 
-    // Check TTL
-    if (Date.now() - entry.timestamp >= this.ttl) {
-      this.store.delete(key);
-      return undefined;
+  for (const [key, entry] of analyticsCache.entries()) {
+    if (now - entry.timestamp > CACHE_TTL_MS) {
+      analyticsCache.delete(key);
+      evictedCount++;
     }
-
-    // Refresh recency: delete and re-set to move to end (most recent)
-    this.store.delete(key);
-    this.store.set(key, entry);
-    return entry.data;
   }
 
-  set(key, data) {
-    // If key exists, delete first to update position
-    if (this.store.has(key)) {
-      this.store.delete(key);
-    }
-
-    // Evict LRU entry if at capacity
-    if (this.store.size >= this.maxSize) {
-      const oldestKey = this.store.keys().next().value;
-      this.store.delete(oldestKey);
-    }
-
-    this.store.set(key, { data, timestamp: Date.now() });
-  }
-
-  delete(key) {
-    return this.store.delete(key);
-  }
-
-  keys() {
-    return this.store.keys();
-  }
-
-  size() {
-    return this.store.size;
-  }
+  logger.info(`Cache sweep: evicted ${evictedCount} entries`);
+  return evictedCount;
 }
 
-const cache = new LRUCache(CACHE_MAX_SIZE, CACHE_TTL);
+let sweepIntervalId = null;
+
+function startCacheSweep() {
+  sweepIntervalId = setInterval(sweepCache, SWEEP_INTERVAL_MS);
+  // Unref so the interval never keeps the process alive on its own.
+  if (sweepIntervalId.unref) {
+    sweepIntervalId.unref();
+  }
+  return sweepIntervalId;
+}
+
+startCacheSweep();
+
+function stopCacheSweep() {
+  clearInterval(sweepIntervalId);
+}
+
+function getCachedAnalytics(publicKey) {
+  const entry = analyticsCache.get(publicKey);
+  if (!entry) return null;
+
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+    analyticsCache.delete(publicKey);
+    return null;
+  }
+
+  return entry.data;
+}
+
+function setCachedAnalytics(publicKey, data) {
+  analyticsCache.set(publicKey, {
+    data,
+    timestamp: Date.now(),
+  });
+}
+
+function clearAnalyticsCache() {
+  analyticsCache.clear();
+}
+
+// ─── Cache Configuration ──────────────────────────────────────────────────────
+//
+// The cache layer (src/services/cache.js) uses Redis when REDIS_URL is set and
+// falls back to an in-process Map otherwise. TTL is configurable via
+// ANALYTICS_CACHE_TTL_MS (default 5 minutes).
 
 /**
  * Cache wrapper function.
+ *
+ * On a cache miss the factory function `fn` is invoked and its return value
+ * is stored for reuse on the next call with the same key.
+ *
  * @param {string} key
  * @param {Function} fn - async function that returns the data
+ * @returns {Promise<*>}
  */
 async function withCache(key, fn) {
-  const cached = cache.get(key);
+  const cached = await cache.get(key);
 
   // Return cached data if still fresh
-  if (cached !== undefined) {
+  if (cached !== null) {
     return cached;
   }
 
-  // Fetch fresh data
   const data = await fn();
 
   // Update cache
-  cache.set(key, data);
+  await cache.set(key, data);
 
   return data;
 }
@@ -102,7 +118,9 @@ async function withCache(key, fn) {
  */
 async function getSummary(publicKey) {
   return withCache(`summary:${publicKey}`, async () => {
-    const payments = await stellarService.getPayments(publicKey, { limit: 200 });
+    const payments = await stellarService.getPayments(publicKey, {
+      limit: 200,
+    });
 
     let totalSent = 0;
     let totalReceived = 0;
@@ -148,14 +166,18 @@ async function getSummary(publicKey) {
     // Compute percentage deltas
     let countChangePercent = 0;
     if (lastWeekCount > 0) {
-      countChangePercent = Math.round(((thisWeekCount - lastWeekCount) / lastWeekCount) * 100);
+      countChangePercent = Math.round(
+        ((thisWeekCount - lastWeekCount) / lastWeekCount) * 100,
+      );
     } else if (thisWeekCount > 0) {
       countChangePercent = 100; // 100% increase if last week was 0
     }
 
     let volumeChangePercent = 0;
     if (lastWeekVolume > 0) {
-      volumeChangePercent = Math.round(((thisWeekVolume - lastWeekVolume) / lastWeekVolume) * 100);
+      volumeChangePercent = Math.round(
+        ((thisWeekVolume - lastWeekVolume) / lastWeekVolume) * 100,
+      );
     } else if (thisWeekVolume > 0) {
       volumeChangePercent = 100;
     }
@@ -185,35 +207,28 @@ async function getSummary(publicKey) {
 async function getTopRecipients(publicKey) {
   return withCache(`top-recipients:${publicKey}`, async () => {
     const payments = await stellarService.getPayments(publicKey, { limit: 200 });
-
-    // Map to track total sent per recipient
     const recipientTotals = new Map();
 
     for (const payment of payments) {
-      // Only count sent payments
       if (payment.type === "sent") {
         const amount = parseFloat(payment.amount);
         const recipient = payment.to;
 
         if (recipientTotals.has(recipient)) {
-          recipientTotals.set(
-            recipient,
-            recipientTotals.get(recipient) + amount
-          );
+          recipientTotals.set(recipient, recipientTotals.get(recipient) + amount);
         } else {
           recipientTotals.set(recipient, amount);
         }
       }
     }
 
-    // Convert to array and sort by amount (descending)
     const sorted = Array.from(recipientTotals.entries())
       .map(([address, total]) => ({
         address,
         totalXLMSent: total.toFixed(7),
       }))
       .sort((a, b) => parseFloat(b.totalXLMSent) - parseFloat(a.totalXLMSent))
-      .slice(0, 5); // Top 5 only
+      .slice(0, 5);
 
     return {
       publicKey,
@@ -229,27 +244,26 @@ async function getTopRecipients(publicKey) {
  */
 async function getActivityByDay(publicKey) {
   return withCache(`activity:${publicKey}`, async () => {
-    const payments = await stellarService.getPayments(publicKey, { limit: 200 });
+    const payments = await stellarService.getPayments(publicKey, {
+      limit: 200,
+    });
 
-    // Initialize counters for all 7 days
     const dayActivity = {
-      0: 0, // Sunday
-      1: 0, // Monday
-      2: 0, // Tuesday
-      3: 0, // Wednesday
-      4: 0, // Thursday
-      5: 0, // Friday
-      6: 0, // Saturday
+      0: 0,
+      1: 0,
+      2: 0,
+      3: 0,
+      4: 0,
+      5: 0,
+      6: 0,
     };
 
-    // Count transactions by day of week
     for (const payment of payments) {
       const date = new Date(payment.createdAt);
       const dayOfWeek = date.getUTCDay();
       dayActivity[dayOfWeek]++;
     }
 
-    // Convert to array format
     const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     const activity = days.map((dayName, index) => ({
       day: dayName,
@@ -363,8 +377,12 @@ function formatCohortBucketLabel(bucketStart, period) {
 }
 
 function formatCohortBucket(bucket, period) {
-  const sentCounterparties = summarizeCounterparties(bucket.sent.counterparties);
-  const receivedCounterparties = summarizeCounterparties(bucket.received.counterparties);
+  const sentCounterparties = summarizeCounterparties(
+    bucket.sent.counterparties,
+  );
+  const receivedCounterparties = summarizeCounterparties(
+    bucket.received.counterparties,
+  );
 
   return {
     periodStart: bucket.bucketStart.toISOString(),
@@ -381,7 +399,8 @@ function formatCohortBucket(bucket, period) {
       counterparties: receivedCounterparties,
     },
     totalCounterparties:
-      sentCounterparties.totalCounterparties + receivedCounterparties.totalCounterparties,
+      sentCounterparties.totalCounterparties +
+      receivedCounterparties.totalCounterparties,
     repeatRate: calculateRepeatRate(sentCounterparties, receivedCounterparties),
     period,
   };
@@ -408,14 +427,16 @@ function summarizeCounterparties(counterpartyCounts) {
 
 function calculateRepeatRate(sentCounterparties, receivedCounterparties) {
   const totalCounterparties =
-    sentCounterparties.totalCounterparties + receivedCounterparties.totalCounterparties;
+    sentCounterparties.totalCounterparties +
+    receivedCounterparties.totalCounterparties;
 
   if (totalCounterparties === 0) {
     return 0;
   }
 
   const repeatCounterparties =
-    sentCounterparties.repeatCounterparties + receivedCounterparties.repeatCounterparties;
+    sentCounterparties.repeatCounterparties +
+    receivedCounterparties.repeatCounterparties;
   return Math.round((repeatCounterparties / totalCounterparties) * 100);
 }
 
@@ -428,64 +449,102 @@ function calculateRepeatRate(sentCounterparties, receivedCounterparties) {
  * - one-time: exactly one payment in the period
  * - repeat: two or more payments in the period
  */
-async function getCohortBreakdown(publicKey, { period = "month", periods = 6 } = {}) {
+async function getCohortBreakdown(
+  publicKey,
+  { period = "month", periods = 6 } = {},
+) {
   const normalizedPeriod = normalizeCohortPeriod(period);
   const normalizedCount = normalizeCohortPeriodCount(periods);
 
-  return withCache(`cohorts:${publicKey}:${normalizedPeriod}:${normalizedCount}`, async () => {
-    const payments = await stellarService.getPayments(publicKey, { limit: 200 });
-    const buckets = buildCohortBuckets(normalizedPeriod, normalizedCount);
-    const bucketMap = new Map(buckets.map((bucket) => [bucket.bucketStart.getTime(), bucket]));
+  return withCache(
+    `cohorts:${publicKey}:${normalizedPeriod}:${normalizedCount}`,
+    async () => {
+      const payments = await stellarService.getPayments(publicKey, {
+        limit: 200,
+      });
+      const buckets = buildCohortBuckets(normalizedPeriod, normalizedCount);
+      const bucketMap = new Map(
+        buckets.map((bucket) => [bucket.bucketStart.getTime(), bucket]),
+      );
 
-    const oldestBucketStart = buckets[0]?.bucketStart ?? null;
-    const newestBucketStart = buckets[buckets.length - 1]?.bucketStart ?? null;
+      const oldestBucketStart = buckets[0]?.bucketStart ?? null;
+      const newestBucketStart =
+        buckets[buckets.length - 1]?.bucketStart ?? null;
 
-    for (const payment of payments) {
-      const paymentDate = new Date(payment.createdAt);
-      const bucketStart = getCohortBucketStart(paymentDate, normalizedPeriod);
+      for (const payment of payments) {
+        const paymentDate = new Date(payment.createdAt);
+        const bucketStart = getCohortBucketStart(paymentDate, normalizedPeriod);
 
-      if (!bucketMap.has(bucketStart.getTime())) {
-        continue;
+        if (!bucketMap.has(bucketStart.getTime())) {
+          continue;
+        }
+
+        const bucket = bucketMap.get(bucketStart.getTime());
+        const amount = parseFloat(payment.amount);
+        const counterparty =
+          payment.type === "sent" ? payment.to : payment.from;
+
+        if (payment.type === "sent") {
+          bucket.sent.paymentCount += 1;
+          bucket.sent.totalXLM += amount;
+          bucket.sent.counterparties.set(
+            counterparty,
+            (bucket.sent.counterparties.get(counterparty) || 0) + 1,
+          );
+        } else {
+          bucket.received.paymentCount += 1;
+          bucket.received.totalXLM += amount;
+          bucket.received.counterparties.set(
+            counterparty,
+            (bucket.received.counterparties.get(counterparty) || 0) + 1,
+          );
+        }
       }
 
-      const bucket = bucketMap.get(bucketStart.getTime());
-      const amount = parseFloat(payment.amount);
-      const counterparty = payment.type === "sent" ? payment.to : payment.from;
+      const cohorts = buckets.map((bucket) =>
+        formatCohortBucket(bucket, normalizedPeriod),
+      );
 
-      if (payment.type === "sent") {
-        bucket.sent.paymentCount += 1;
-        bucket.sent.totalXLM += amount;
-        bucket.sent.counterparties.set(
-          counterparty,
-          (bucket.sent.counterparties.get(counterparty) || 0) + 1
-        );
-      } else {
-        bucket.received.paymentCount += 1;
-        bucket.received.totalXLM += amount;
-        bucket.received.counterparties.set(
-          counterparty,
-          (bucket.received.counterparties.get(counterparty) || 0) + 1
-        );
-      }
-    }
-
-    const cohorts = buckets.map((bucket) => formatCohortBucket(bucket, normalizedPeriod));
-
-    return {
-      publicKey,
-      period: normalizedPeriod,
-      periods: normalizedCount,
-      range: {
-        start: oldestBucketStart ? oldestBucketStart.toISOString() : null,
-        end: newestBucketStart ? getCohortBucketEnd(newestBucketStart, normalizedPeriod).toISOString() : null,
-      },
-      cohorts,
-    };
-  });
+      return {
+        publicKey,
+        period: normalizedPeriod,
+        periods: normalizedCount,
+        range: {
+          start: oldestBucketStart ? oldestBucketStart.toISOString() : null,
+          end: newestBucketStart
+            ? getCohortBucketEnd(
+                newestBucketStart,
+                normalizedPeriod,
+              ).toISOString()
+            : null,
+        },
+        cohorts,
+      };
+    },
+  );
 }
 
 // In-memory store for scheduled exports: Map<publicKey, { email, frequency, nextRunAt }>
 const exportSchedules = new Map();
+
+/**
+ * Resolve the email transport lazily.
+ *
+ * The SMTP transport is an optional dependency: deployments without an email
+ * provider still load this module, and only fail if an export is actually
+ * triggered. Resolving on demand keeps `require` side-effect free for the
+ * analytics read paths.
+ *
+ * @returns {{ sendEmail: (opts: { to: string, subject: string, html: string }) => Promise<unknown> } | null}
+ */
+function getEmailService() {
+  try {
+    // eslint-disable-next-line global-require
+    return require("./emailService");
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Opt-in/schedule a recurring email export.
@@ -548,7 +607,7 @@ async function triggerEmailExport(publicKey) {
   const htmlContent = `
     <h1>Stellar MicroPay Summary Data Export</h1>
     <p>PublicKey: <code>${publicKey}</code></p>
-    
+
     <h2>Summary Statistics</h2>
     <ul>
       <li>Total Sent: ${summary.totalSentXLM} XLM</li>
@@ -560,14 +619,23 @@ async function triggerEmailExport(publicKey) {
 
     <h2>Top Recipients</h2>
     <ol>
-      ${topRecipients.topRecipients.map(r => `<li><code>${r.address}</code>: ${r.totalXLMSent} XLM</li>`).join("")}
+      ${topRecipients.topRecipients.map((r) => `<li><code>${r.address}</code>: ${r.totalXLMSent} XLM</li>`).join("")}
     </ol>
 
     <h2>Weekly Activity</h2>
     <ul>
-      ${activity.activityByDay.map(d => `<li>${d.day}: ${d.transactionCount} payments</li>`).join("")}
+      ${activity.activityByDay.map((d) => `<li>${d.day}: ${d.transactionCount} payments</li>`).join("")}
     </ul>
   `;
+
+  const emailService = getEmailService();
+  if (!emailService) {
+    const error = new Error(
+      "Scheduled email exports are unavailable: no email transport is configured",
+    );
+    error.status = 501;
+    throw error;
+  }
 
   await emailService.sendEmail({
     to: schedule.email,
@@ -580,24 +648,21 @@ async function triggerEmailExport(publicKey) {
 
 /**
  * Clear cache for a specific public key (optional helper).
- * Useful for manual cache invalidation if needed.
+ *
+ * Removes every cache entry whose key starts with one of the analytics
+ * prefixes for `publicKey` — summary, top-recipients, activity, and cohorts.
+ *
+ * @param {string} publicKey
+ * @returns {Promise<void>}
  */
-function clearCache(publicKey) {
-  const prefixes = [
-    `summary:${publicKey}`,
-    `top-recipients:${publicKey}`,
-    `activity:${publicKey}`,
-    `cohorts:${publicKey}`,
-  ];
-
-  for (const key of cache.keys()) {
-    for (const prefix of prefixes) {
-      if (key.startsWith(prefix)) {
-        cache.delete(key);
-        break;
-      }
-    }
-  }
+async function clearCache(publicKey) {
+  const counts = await Promise.all([
+    cache.clearByPrefix(`summary:${publicKey}`),
+    cache.clearByPrefix(`top-recipients:${publicKey}`),
+    cache.clearByPrefix(`activity:${publicKey}`),
+    cache.clearByPrefix(`cohorts:${publicKey}`),
+  ]);
+  return counts.reduce((a, b) => a + b, 0);
 }
 
 module.exports = {
@@ -609,4 +674,12 @@ module.exports = {
   scheduleExport,
   getExportSchedule,
   triggerEmailExport,
+  withCache,
+  cache,
+  stopCacheSweep,
+  startCacheSweep,
+  sweepCache,
+  getCachedAnalytics,
+  setCachedAnalytics,
+  clearAnalyticsCache,
 };

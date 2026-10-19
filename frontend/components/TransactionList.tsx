@@ -3,11 +3,8 @@
  * Displays paginated payment history for a Stellar account.
  */
 
-import { useState, useEffect, useCallback, useRef, memo } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/router";
-import type { FixedSizeList, ListOnItemsRenderedProps } from "react-window";
-import { withErrorBoundary } from "@/components/ErrorBoundary";
-import VirtualizedList from "@/components/VirtualizedList";
 import {
   getPaymentHistory,
   shortenAddress,
@@ -15,173 +12,26 @@ import {
   PaymentRecord,
   PaymentHistoryResponse,
 } from "@/lib/stellar";
-import { formatAsset, timeAgo, copyToClipboard } from "@/utils/format";
-import { loadAddressBookContacts, upsertAddressBookContact } from "@/lib/addressBook";
+import { copyToClipboard, exportFilteredTransactionsToCSV } from "@/utils/format";
 import {
-  HistoryIcon,
-  ArrowUpIcon,
-  ArrowDownIcon,
-  RefreshIcon,
-  ExternalLinkIcon,
-} from "@/components/icons";
+  formatAsset,
+  formatDateTimeShort,
+  formatRelativeTime,
+} from "@/utils/intlFormatters";
+import { loadAllPaymentNotes, savePaymentNote } from "@/lib/usePaymentNotes";
+import { useToast } from "@/lib/useToast";
+import { isReceiptEligible } from "@/lib/receipts";
+import { useTranslation } from "@/contexts/I18nContext";
+import Toast from "@/components/Toast";
 import clsx from "clsx";
-
-/** @internal Incremented only in test to assert memo bail-outs. */
-export let __transactionRowRenderCount = 0;
-export function __resetTransactionRowRenderCount() {
-  __transactionRowRenderCount = 0;
-}
-
-export interface TransactionRowProps {
-  tx: PaymentRecord;
-  index: number;
-  isFocused: boolean;
-  isCopied: boolean;
-  onCopy: (text: string, id: string) => void;
-  onSaveContact: (address: string) => void;
-  onSendAgain: (to: string, amount: string) => void;
-  onFocusRow: (index: number) => void;
-  onBlurRow: () => void;
-  onNavigate: (direction: "up" | "down") => void;
-}
-
-export const TransactionRow = memo(function TransactionRow({
-  tx,
-  index,
-  isFocused,
-  isCopied,
-  onCopy,
-  onSaveContact,
-  onSendAgain,
-  onFocusRow,
-  onBlurRow,
-  onNavigate,
-}: TransactionRowProps) {
-  if (process.env.NODE_ENV === "test") {
-    __transactionRowRenderCount += 1;
-  }
-
-  const counterparty = tx.type === "sent" ? tx.to : tx.from;
-
-  return (
-    <div
-      role="listitem"
-      tabIndex={isFocused ? 0 : -1}
-      onKeyDown={(e) => {
-        if (e.key === "ArrowDown") {
-          e.preventDefault();
-          onNavigate("down");
-        } else if (e.key === "ArrowUp") {
-          e.preventDefault();
-          onNavigate("up");
-        } else if (e.key === "Enter" && isFocused) {
-          e.preventDefault();
-          onCopy(counterparty, tx.id);
-        }
-      }}
-      onBlur={onBlurRow}
-      onFocus={() => onFocusRow(index)}
-      className={clsx(
-        "flex items-center gap-3 p-3 rounded-xl bg-white/3 hover:bg-white/5 transition-colors group relative",
-        isFocused && "outline-none ring-2 ring-stellar-500 ring-offset-2"
-      )}
-      aria-label={`${tx.type === "sent" ? "Sent" : "Received"} ${formatAsset(tx.amount, tx.asset)} ${tx.type === "sent" ? "to" : "from"} ${counterparty}`}
-    >
-      <div
-        className={clsx(
-          "w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0",
-          tx.type === "sent"
-            ? "bg-red-500/10 border border-red-500/20"
-            : "bg-emerald-500/10 border border-emerald-500/20"
-        )}
-      >
-        {tx.type === "sent" ? (
-          <ArrowUpIcon className="w-4 h-4 text-red-400" />
-        ) : (
-          <ArrowDownIcon className="w-4 h-4 text-emerald-400" />
-        )}
-      </div>
-
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-slate-200 capitalize">
-            {tx.type === "sent" ? "Sent to" : "Received from"}
-          </span>
-          <button
-            onClick={() => onCopy(counterparty, tx.id)}
-            aria-label={`Copy ${tx.type === "sent" ? "recipient" : "sender"} address`}
-            className="address-pill hover:border-stellar-500/40 transition-colors text-xs"
-          >
-            {isCopied ? "Copied!" : shortenAddress(counterparty, 5)}
-          </button>
-        </div>
-        <div className="flex items-center gap-2 mt-0.5">
-          <span className="text-xs text-slate-400">{timeAgo(tx.createdAt)}</span>
-          {tx.memo && (
-            <span className="text-xs text-slate-600 truncate max-w-32">
-              · &ldquo;{tx.memo}&rdquo;
-            </span>
-          )}
-        </div>
-      </div>
-
-      <div className="flex items-center gap-2 flex-shrink-0">
-        <span
-          className={clsx(
-            "text-sm font-mono font-medium",
-            tx.type === "sent" ? "text-red-400" : "text-emerald-400"
-          )}
-        >
-          {tx.type === "sent" ? "-" : "+"}
-          {formatAsset(tx.amount, tx.asset)}
-        </span>
-
-        <button
-          onClick={() => onSaveContact(counterparty)}
-          className="opacity-0 group-hover:opacity-100 transition-opacity text-xs text-slate-400 hover:text-stellar-300 font-medium whitespace-nowrap"
-          title="Save this address to contacts"
-          aria-label={`Save ${tx.type === "sent" ? "recipient" : "sender"} to contacts`}
-        >
-          Save contact
-        </button>
-
-        {tx.type === "sent" && (
-          <button
-            onClick={() => onSendAgain(tx.to, tx.amount)}
-            className="opacity-0 group-hover:opacity-100 transition-opacity text-xs text-stellar-400 hover:text-stellar-300 font-medium whitespace-nowrap"
-            title="Pre-fill send form with this transaction"
-            aria-label="Send again to this recipient"
-          >
-            Send again
-          </button>
-        )}
-
-        <a
-          href={explorerUrl(tx.transactionHash) ?? undefined}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-stellar-400"
-          title="View on Stellar Expert"
-          aria-label="View transaction on Stellar Expert"
-        >
-          <ExternalLinkIcon className="w-3.5 h-3.5" />
-        </a>
-      </div>
-    </div>
-  );
-});
-
-// Rows render virtualized past this count so long payment histories stay cheap to render.
-const VIRTUALIZE_THRESHOLD = 100;
-const ROW_HEIGHT_PX = 76;
-const VIRTUAL_VIEWPORT_HEIGHT_PX = ROW_HEIGHT_PX * 6;
 
 export type TransactionDirectionFilter = "all" | "sent" | "received";
 
 export interface TransactionFilters {
-  direction: TransactionDirectionFilter;
-  minAmount: string;
-  memoSearch: string;
+  direction?: TransactionDirectionFilter;
+  minAmount?: string;
+  memoSearch?: string;
+  searchQuery?: string;
 }
 
 interface TransactionListProps {
@@ -193,9 +43,17 @@ interface TransactionListProps {
   onPaymentsChange?: (payments: PaymentRecord[]) => void;
   /** Called when the user wants to print a receipt for a payment. */
   onPrintReceipt?: (payment: PaymentRecord) => void;
+  /** Called when the user wants to mint an on-chain receipt for a sent payment. */
+  onMintReceipt?: (payment: PaymentRecord) => void;
+  /** Transaction hash of the payment whose receipt is currently being minted. */
+  mintingReceiptHash?: string | null;
+  /** Transaction hashes that already have a minted receipt. */
+  mintedReceiptHashes?: Record<string, number>;
   /** Optional single incoming payment to prepend in real-time. */
   incomingPayment?: PaymentRecord | null;
   onSendAgain?: (to: string, amount: string) => void;
+  onRepeatPayment?: (payment: PaymentRecord) => void;
+  hideSearchBar?: boolean;
 }
 
 interface CachedPaymentHistory {
@@ -244,86 +102,177 @@ function savePaymentHistorySnapshot(
 }
 
 function formatSnapshotTime(savedAt: number) {
-  return new Date(savedAt).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  return formatDateTimeShort(savedAt);
+}
+
+export function matchesPaymentSearch(payment: PaymentRecord, rawQuery: string): boolean {
+  const query = rawQuery.trim();
+  if (!query) return true;
+
+  const lowerQuery = query.toLowerCase();
+
+  // Check amount comparison syntax: e.g. >10, >=10, <5, <=5, =10, or >10 XLM
+  const compMatch = query.match(/^([><]=?|=)\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:xlm|usdc))?$/i);
+  if (compMatch) {
+    const op = compMatch[1];
+    const targetAmt = parseFloat(compMatch[2]);
+    const amt = parseFloat(payment.amount);
+    if (!isNaN(amt) && !isNaN(targetAmt)) {
+      if (op === ">") return amt > targetAmt;
+      if (op === ">=") return amt >= targetAmt;
+      if (op === "<") return amt < targetAmt;
+      if (op === "<=") return amt <= targetAmt;
+      if (op === "=") return Math.abs(amt - targetAmt) < 0.0000001;
+    }
+  }
+
+  // Pure numeric / formatted amount match e.g. "10", "10.5", "10 XLM"
+  const numMatch = query.match(/^([0-9]+(?:\.[0-9]+)?)(?:\s*(?:xlm|usdc))?$/i);
+  if (numMatch) {
+    const targetAmt = parseFloat(numMatch[1]);
+    const amt = parseFloat(payment.amount);
+    if (!isNaN(amt) && !isNaN(targetAmt) && (amt === targetAmt || payment.amount.includes(numMatch[1]))) {
+      return true;
+    }
+  }
+
+  // Destination address match
+  if (payment.to && payment.to.toLowerCase().includes(lowerQuery)) {
+    return true;
+  }
+
+  // Source address match
+  if (payment.from && payment.from.toLowerCase().includes(lowerQuery)) {
+    return true;
+  }
+
+  // Memo match
+  if (payment.memo && payment.memo.toLowerCase().includes(lowerQuery)) {
+    return true;
+  }
+
+  // Transaction hash match
+  if (payment.transactionHash && payment.transactionHash.toLowerCase().includes(lowerQuery)) {
+    return true;
+  }
+
+  return false;
 }
 
 export function filterPayments(
   payments: PaymentRecord[],
   filters: TransactionFilters
 ): PaymentRecord[] {
+  const direction = filters.direction || "all";
   const minimumAmount =
-    filters.minAmount.trim() === "" ? null : Number(filters.minAmount);
+    filters.minAmount && filters.minAmount.trim() !== "" ? Number(filters.minAmount) : null;
   const hasMinimumAmount =
     minimumAmount !== null && Number.isFinite(minimumAmount) && minimumAmount >= 0;
-  const memoQuery = filters.memoSearch.trim().toLowerCase();
+  const memoQuery = (filters.memoSearch || "").trim().toLowerCase();
+  const search = (filters.searchQuery || "").trim();
 
   return payments.filter((payment) => {
     const matchesDirection =
-      filters.direction === "all" || payment.type === filters.direction;
+      direction === "all" || payment.type === direction;
     const matchesAmount =
       !hasMinimumAmount || Number(payment.amount) >= (minimumAmount ?? 0);
     const matchesMemo =
       !memoQuery ||
       (payment.memo && payment.memo.toLowerCase().includes(memoQuery));
+    const matchesSearch = !search || matchesPaymentSearch(payment, search);
 
-    return matchesDirection && matchesAmount && matchesMemo;
+    return matchesDirection && matchesAmount && matchesMemo && matchesSearch;
   });
 }
 
-function TransactionList({
+export default function TransactionList({
   publicKey,
   limit = 20,
   compact = false,
   filters = { direction: "all", minAmount: "", memoSearch: "" },
   onPaymentsChange,
   onPrintReceipt,
+  onMintReceipt,
+  mintingReceiptHash = null,
+  mintedReceiptHashes = {},
   incomingPayment,
+  onSendAgain,
+  onRepeatPayment,
+  hideSearchBar = false,
 }: TransactionListProps) {
+  const router = useRouter();
+  const { t } = useTranslation();
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [focusedIndex, setFocusedIndex] = useState(-1);
   const [stalePaymentsAt, setStalePaymentsAt] = useState<number | null>(null);
-  const router = useRouter();
+  const [isMobile, setIsMobile] = useState(false);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
 
-  const lastPagingTokenRef = useRef<string | undefined>(undefined);
-  const [infiniteScroll, setInfiniteScroll] = useState(false);
-  const virtualListRef = useRef<FixedSizeList>(null);
-  const fetchingMoreRef = useRef(false);
+  // Search state with 300ms debounce (#1186)
+  const initialQuery = (router.query?.q as string) || filters.searchQuery || "";
+  const [searchInputValue, setSearchInputValue] = useState(initialQuery);
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState(initialQuery);
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const visiblePayments = filterPayments(payments, filters);
-
-  // Sentinel ref for IntersectionObserver — defer initial fetch until visible
-  const containerRef = useRef<HTMLDivElement>(null);
-  const loadMoreRef = useRef<HTMLDivElement>(null);
-  const [isVisible, setIsVisible] = useState(false);
+  const { visible: toastVisible, message: toastMessage, showToast } = useToast(2500);
 
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el || typeof IntersectionObserver === "undefined") {
-      setIsVisible(true);
-      return;
+    if (router.isReady && typeof router.query.q === "string") {
+      setSearchInputValue(router.query.q);
+      setDebouncedSearchQuery(router.query.q);
     }
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) {
-          setIsVisible(true);
-          observer.disconnect();
+  }, [router.isReady, router.query.q]);
+
+  const handleSearchChange = (val: string) => {
+    setSearchInputValue(val);
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => {
+      setDebouncedSearchQuery(val);
+      if (router.isReady) {
+        const nextQuery = { ...router.query };
+        if (val.trim()) {
+          nextQuery.q = val.trim();
+        } else {
+          delete nextQuery.q;
         }
-      },
-      { rootMargin: "200px" }
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
+        router.replace({ pathname: router.pathname, query: nextQuery }, undefined, { shallow: true });
+      }
+    }, 300);
+  };
+
+  const handleRepeatPayment = (tx: PaymentRecord) => {
+    const targetAddress = tx.type === "sent" ? tx.to : tx.from;
+    const shortAddr = shortenAddress(targetAddress, 4);
+    showToast(t("transactionList.repeatingPayment", { address: shortAddr }));
+    if (onRepeatPayment) {
+      onRepeatPayment(tx);
+    }
+    if (onSendAgain) {
+      onSendAgain(targetAddress, tx.amount);
+    }
+    const query: Record<string, string> = {
+      to: targetAddress,
+      amount: tx.amount,
+    };
+    if (tx.memo) {
+      query.memo = tx.memo;
+    }
+    router.push({
+      pathname: "/dashboard",
+      query,
+    });
+  };
+
+  // Private off-chain payment notes — Issue #1189
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [editingNoteHash, setEditingNoteHash] = useState<string | null>(null);
+  const [noteInputValue, setNoteInputValue] = useState("");
 
   const updatePayments = useCallback(
     (next: PaymentRecord[]) => {
@@ -333,6 +282,36 @@ function TransactionList({
     [onPaymentsChange]
   );
 
+  // Load all saved notes on mount
+  useEffect(() => {
+    setNotes(loadAllPaymentNotes());
+  }, []);
+
+  const handleStartEditNote = (hash: string) => {
+    setEditingNoteHash(hash);
+    setNoteInputValue(notes[hash] ?? "");
+  };
+
+  const handleSaveNote = (hash: string) => {
+    savePaymentNote(hash, noteInputValue);
+    setNotes((prev) => {
+      const next = { ...prev };
+      if (noteInputValue.trim() === "") {
+        delete next[hash];
+      } else {
+        next[hash] = noteInputValue.trim();
+      }
+      return next;
+    });
+    setEditingNoteHash(null);
+    setNoteInputValue("");
+  };
+
+  const handleCancelEditNote = () => {
+    setEditingNoteHash(null);
+    setNoteInputValue("");
+  };
+
   const fetchPayments = useCallback(
     async (isLoadMore = false) => {
       if (isLoadMore) {
@@ -340,16 +319,15 @@ function TransactionList({
       } else {
         setLoading(true);
         updatePayments([]);
-        lastPagingTokenRef.current = undefined;
+        setNextCursor(undefined);
         setHasMore(true);
       }
       setError(null);
       try {
-        const cursorToUse = isLoadMore ? lastPagingTokenRef.current : undefined;
         const data: PaymentHistoryResponse = await getPaymentHistory(
           publicKey,
           limit,
-          cursorToUse
+          isLoadMore ? nextCursor : undefined
         );
 
         if (isLoadMore) {
@@ -373,8 +351,7 @@ function TransactionList({
         }
 
         setHasMore(data.hasMore);
-        const nextToken = data.records[data.records.length - 1]?.pagingToken;
-        lastPagingTokenRef.current = nextToken;
+        setNextCursor(data.nextCursor);
         setStalePaymentsAt(null);
       } catch (err) {
         const cached = !isLoadMore
@@ -383,114 +360,68 @@ function TransactionList({
         if (cached) {
           updatePayments(cached.records);
           setHasMore(cached.hasMore);
-          lastPagingTokenRef.current = cached.records[cached.records.length - 1]?.pagingToken;
+          setNextCursor(cached.nextCursor);
           setStalePaymentsAt(cached.savedAt);
           setError(null);
           return;
         }
 
-        setError("Could not load transaction history.");
+        setError(t("transactionList.loadFailed"));
         console.error(err);
       } finally {
         setLoading(false);
         setLoadingMore(false);
       }
     },
-    [publicKey, limit, updatePayments, onPaymentsChange]
+    [publicKey, limit, nextCursor, updatePayments, onPaymentsChange, t]
   );
 
-  // IntersectionObserver effect for Infinite Scroll
   useEffect(() => {
-    if (!infiniteScroll || !hasMore || loadingMore || loading) return;
+    fetchPayments();
+  }, [fetchPayments]);
 
-    const el = loadMoreRef.current;
-    if (!el || typeof IntersectionObserver === "undefined") return;
+  const handleLoadMore = useCallback(() => fetchPayments(true), [fetchPayments]);
+
+  // Track the mobile breakpoint (<= 768px) so infinite scroll can replace
+  // the pagination button on small screens while desktop keeps the button.
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const mql = window.matchMedia("(max-width: 768px)");
+    const update = () => setIsMobile(mql.matches);
+    update();
+    mql.addEventListener?.("change", update);
+    return () => mql.removeEventListener?.("change", update);
+  }, []);
+
+  // Infinite scroll: observe a sentinel at the bottom of the list and load the
+  // next page as soon as it scrolls into view. Mobile only — desktop uses the
+  // pagination button fallback below.
+  useEffect(() => {
+    if (!isMobile || !hasMore || loading || loadingMore) return;
+
+    const node = sentinelRef.current;
+    if (!node || typeof IntersectionObserver === "undefined") return;
 
     const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) {
-          fetchPayments(true);
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          handleLoadMore();
         }
       },
-      { rootMargin: "200px" }
+      { rootMargin: "0px 0px 120px 0px" }
     );
-    observer.observe(el);
+
+    observer.observe(node);
     return () => observer.disconnect();
-  }, [infiniteScroll, hasMore, loadingMore, loading, fetchPayments]);
+  }, [isMobile, hasMore, loading, loadingMore, handleLoadMore]);
 
-  useEffect(() => {
-    if (!isVisible) return;
-    fetchPayments();
-  }, [fetchPayments, isVisible]);
-
-  const handleLoadMore = () => fetchPayments(true);
-
-  const handleCopy = useCallback(async (text: string, id: string) => {
+  const handleCopy = async (text: string, id: string) => {
     await copyToClipboard(text);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2000);
-  }, []);
-
-  const handleSaveContact = useCallback((address: string) => {
-    const existing = loadAddressBookContacts().find((contact) => contact.address === address);
-    const nickname = window.prompt(
-      existing ? "Update contact nickname:" : "Nickname for this contact:",
-      existing?.nickname || address.slice(0, 8)
-    );
-
-    if (!nickname) return;
-    upsertAddressBookContact({ nickname, address });
-  }, []);
-
-  const handleSendAgain = useCallback(
-    (to: string, amount: string) => {
-      router.push(
-        `/dashboard?to=${encodeURIComponent(to)}&amount=${encodeURIComponent(amount)}`
-      );
-    },
-    [router]
-  );
-
-  const handleFocusRow = useCallback((index: number) => {
-    setFocusedIndex(index);
-  }, []);
-
-  const handleBlurRow = useCallback(() => {
-    setFocusedIndex(-1);
-  }, []);
-
-  const handleNavigate = useCallback(
-    (direction: "up" | "down") => {
-      setFocusedIndex((prev) =>
-        direction === "down"
-          ? Math.min(prev + 1, visiblePayments.length - 1)
-          : Math.max(prev - 1, 0)
-      );
-    },
-    [visiblePayments.length]
-  );
-
-  // When virtualized, "Load more" / infinite scroll can't rely on a DOM
-  // sentinel below the list (react-window scrolls its own inner viewport),
-  // so trigger the next page once the rendered window nears the end instead.
-  const handleVirtualItemsRendered = useCallback(
-    ({ visibleStopIndex }: ListOnItemsRenderedProps) => {
-      if (!infiniteScroll || !hasMore || loading || fetchingMoreRef.current) return;
-      if (visibleStopIndex < visiblePayments.length - 5) return;
-
-      fetchingMoreRef.current = true;
-      fetchPayments(true).finally(() => {
-        fetchingMoreRef.current = false;
-      });
-    },
-    [infiniteScroll, hasMore, loading, fetchPayments, visiblePayments.length]
-  );
-
-  // Keep the focused row scrolled into view for keyboard navigation once virtualized.
-  useEffect(() => {
-    if (focusedIndex < 0) return;
-    virtualListRef.current?.scrollToItem(focusedIndex, "smart");
-  }, [focusedIndex]);
+  };
 
   // Prepend a newly streamed payment if it doesn't already exist
   useEffect(() => {
@@ -505,39 +436,28 @@ function TransactionList({
     });
   }, [incomingPayment, onPaymentsChange]);
 
-  const hasActiveFilters =
-    filters.direction !== "all" || filters.minAmount.trim() !== "" || filters.memoSearch.trim() !== "";
+  const effectiveFilters: TransactionFilters = {
+    ...filters,
+    searchQuery: debouncedSearchQuery || filters.searchQuery || "",
+  };
 
-  const renderPaymentRow = useCallback(
-    (tx: PaymentRecord, index: number) => (
-      <TransactionRow
-        tx={tx}
-        index={index}
-        isFocused={focusedIndex === index}
-        isCopied={copiedId === tx.id}
-        onCopy={handleCopy}
-        onSaveContact={handleSaveContact}
-        onSendAgain={handleSendAgain}
-        onFocusRow={handleFocusRow}
-        onBlurRow={handleBlurRow}
-        onNavigate={handleNavigate}
-      />
-    ),
-    [
-      focusedIndex,
-      copiedId,
-      handleCopy,
-      handleSaveContact,
-      handleSendAgain,
-      handleFocusRow,
-      handleBlurRow,
-      handleNavigate,
-    ]
-  );
+  const visiblePayments = filterPayments(payments, effectiveFilters);
+  const hasActiveFilters =
+    (filters.direction && filters.direction !== "all") ||
+    (filters.minAmount && filters.minAmount.trim() !== "") ||
+    (filters.memoSearch && filters.memoSearch.trim() !== "") ||
+    debouncedSearchQuery.trim() !== "";
+
+  // Issue #1046 — export exactly what is on screen: the currently filtered,
+  // loaded rows (not all pages). Filename embeds a short key + today's date.
+  const handleExportCsv = () => {
+    if (visiblePayments.length === 0) return;
+    exportFilteredTransactionsToCSV(visiblePayments, publicKey);
+  };
 
   if (loading) {
     return (
-      <div ref={containerRef} className={compact ? "" : "card"}>
+      <div className={compact ? "" : "card"} aria-busy="true">
         {!compact && (
           <div className="flex items-center justify-between mb-6">
             <div className="h-5 w-36 rounded-lg bg-cosmos-700 animate-pulse" />
@@ -568,14 +488,14 @@ function TransactionList({
 
   if (error) {
     return (
-      <div ref={containerRef} className={compact ? "" : "card"}>
+      <div className={compact ? "" : "card"}>
         <div className="text-center py-8">
           <p className="text-red-400 text-sm mb-3">{error}</p>
           <button
             onClick={() => fetchPayments()}
             className="btn-secondary text-sm py-2 px-4"
           >
-            Try again
+            {t("transactionList.tryAgain")}
           </button>
         </div>
       </div>
@@ -583,136 +503,461 @@ function TransactionList({
   }
 
   if (payments.length === 0) {
-    if (compact) return null;
     return (
-      <div ref={containerRef} className="card">
+      <div className={compact ? "" : "card"}>
         <div className="text-center py-12">
           <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-white/5 flex items-center justify-center">
-            <HistoryIcon className="w-6 h-6 text-slate-400" />
+            <HistoryIcon className="w-6 h-6 text-slate-500" />
           </div>
-          <p className="text-slate-400 text-sm">No transactions yet</p>
+          <p className="text-slate-400 text-sm">{t("transactionList.emptyTitle")}</p>
           <p className="text-slate-600 text-xs mt-1">
-            Send your first payment to get started
+            {t("transactionList.emptyHint")}
           </p>
-          {process.env.NEXT_PUBLIC_STELLAR_NETWORK !== "mainnet" && (
-            <p className="text-xs mt-3">
-              Need test XLM?{" "}
-              <a
-                href={`https://friendbot.stellar.org/?addr=${publicKey}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-stellar-400 hover:underline"
-              >
-                Fund this account with Friendbot
-              </a>
-            </p>
-          )}
         </div>
       </div>
     );
   }
 
   return (
-    <div ref={containerRef} className={compact ? "" : "card"}>
-          {!compact && (
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="font-display text-lg font-semibold text-white flex items-center gap-2">
-                <HistoryIcon className="w-5 h-5 text-stellar-400" />
-                Recent Payments
-              </h2>
-              <div className="flex items-center gap-4">
-                {/* Premium Infinite Scroll Toggle */}
-                <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-400 select-none">
-                  <span className={clsx("transition-colors", infiniteScroll ? "text-stellar-400 font-medium" : "")}>
-                    Infinite Scroll
-                  </span>
-                  <div className="relative">
-                    <input
-                      type="checkbox"
-                      className="sr-only"
-                      checked={infiniteScroll}
-                      onChange={(e) => setInfiniteScroll(e.target.checked)}
-                      aria-label="Toggle infinite scroll"
-                    />
-                    <div className={clsx(
-                      "w-8 h-4 rounded-full transition-colors duration-200 ease-in-out",
-                      infiniteScroll ? "bg-stellar-500/30 border border-stellar-400/40" : "bg-white/10 border border-white/5"
-                    )} />
-                    <div className={clsx(
-                      "absolute left-0.5 top-0.5 w-3 h-3 rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm",
-                      infiniteScroll ? "transform translate-x-4 bg-stellar-300" : "bg-slate-400"
-                    )} />
-                  </div>
-                </label>
-                <button
-                  onClick={() => fetchPayments()}
-                  className="text-xs text-slate-400 hover:text-stellar-400 transition-colors flex items-center gap-1"
-                >
-                  <RefreshIcon className="w-3.5 h-3.5" />
-                  Refresh
-                </button>
-              </div>
-            </div>
-          )}
-
-          {stalePaymentsAt && (
-            <div className="mb-4 inline-flex items-center rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-xs font-medium text-amber-200">
-              Offline history snapshot from {formatSnapshotTime(stalePaymentsAt)}
-            </div>
-          )}
-          
-          <div className="mb-4 flex items-center gap-3 text-xs text-stellar-400">
-            <span className="w-1 h-1 rounded-full bg-stellar-400 flex-shrink-0" />
-            <span>Keyboard navigation: ↑ ↓ to navigate, Enter to copy address</span>
+    <div className={compact ? "" : "card"}>
+      {!compact && (
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="font-display text-lg font-semibold text-white flex items-center gap-2">
+            <HistoryIcon className="w-5 h-5 text-stellar-400" />
+            {t("transactionList.recentPayments")}
+          </h2>
+          <div className="flex items-center gap-4">
+            {/* Export CSV — exports the currently filtered and loaded rows
+                only (Issue #1046). Disabled while history is loading or
+                when there is nothing to export. */}
+            <button
+              type="button"
+              onClick={handleExportCsv}
+              disabled={loading || loadingMore || visiblePayments.length === 0}
+              title={t("transactionList.exportCsvTitle")}
+              data-testid="export-csv-button"
+              className={clsx(
+                "text-xs transition-colors flex items-center gap-1 cursor-pointer",
+                loading || loadingMore || visiblePayments.length === 0
+                  ? "text-slate-600 cursor-not-allowed"
+                  : "text-slate-500 hover:text-stellar-400"
+              )}
+            >
+              <DownloadIcon className="w-3.5 h-3.5" />
+              {t("transactionList.exportCsv")}
+            </button>
+            <button
+              onClick={() => fetchPayments()}
+              className="text-xs text-slate-500 hover:text-stellar-400 transition-colors flex items-center gap-1 cursor-pointer"
+            >
+              <RefreshIcon className="w-3.5 h-3.5" />
+              {t("transactionList.refresh")}
+            </button>
           </div>
-          
-          <VirtualizedList
-            items={visiblePayments}
-            itemKey={(tx) => tx.id}
-            renderItem={renderPaymentRow}
-            itemHeight={ROW_HEIGHT_PX}
-            height={VIRTUAL_VIEWPORT_HEIGHT_PX}
-            threshold={VIRTUALIZE_THRESHOLD}
-            ariaLabel="Payment history"
-            className="space-y-2"
-            listRef={virtualListRef}
-            onItemsRendered={handleVirtualItemsRendered}
-          />
+        </div>
+      )}
 
-        {/* Infinite Scroll Sentinel / Loading Indicator */}
-        {infiniteScroll && (
-          <div ref={loadMoreRef} className="flex justify-center mt-4 py-2">
-            {loadingMore && (
-              <div className="flex items-center gap-2 text-slate-400">
-                <div className="w-4 h-4 border-2 border-stellar-400 border-t-transparent rounded-full animate-spin" />
-                <span className="text-sm">Loading more...</span>
+      {/* Search Input with 300ms Debounce (#1186) */}
+      {!hideSearchBar && (
+        <div className="relative mb-4">
+          <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400">
+            <SearchIcon className="w-4 h-4" />
+          </div>
+          <input
+            type="text"
+            value={searchInputValue}
+            onChange={(e) => handleSearchChange(e.target.value)}
+            placeholder={t("transactionList.searchPlaceholder")}
+            className="input-field pl-9 pr-8 py-2 text-sm w-full bg-white/[0.04] border-white/10 rounded-xl focus:border-stellar-400"
+            aria-label={t("transactionList.searchLabel")}
+          />
+          {searchInputValue && (
+            <button
+              type="button"
+              onClick={() => handleSearchChange("")}
+              className="absolute inset-y-0 right-0 flex items-center pr-3 text-slate-400 hover:text-slate-200 cursor-pointer"
+              aria-label={t("transactionList.clearSearch")}
+            >
+              <CloseIcon className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      )}
+
+      {stalePaymentsAt && (
+        <div className="mb-4 inline-flex items-center rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-xs font-medium text-amber-200">
+          {t("transactionList.offlineSnapshot", { time: formatSnapshotTime(stalePaymentsAt) })}
+        </div>
+      )}
+
+      <div className="mb-4 flex items-center gap-3 text-xs text-stellar-400">
+        <span className="w-1 h-1 rounded-full bg-stellar-400 flex-shrink-0" />
+        <span>{t("transactionList.keyboardNav")}</span>
+      </div>
+
+      <div className="space-y-2">
+        {visiblePayments.length === 0 ? (
+          <div className="text-center py-10 rounded-xl bg-white/[0.02] border border-white/5 my-2">
+            <div className="w-10 h-10 mx-auto mb-2 rounded-full bg-white/5 flex items-center justify-center text-slate-500">
+              <SearchIcon className="w-5 h-5" />
+            </div>
+            <p className="text-slate-300 text-sm font-medium">{t("transactionList.noMatches")}</p>
+            <p className="text-slate-500 text-xs mt-1">{t("transactionList.noMatchesHint")}</p>
+            {searchInputValue && (
+              <button
+                type="button"
+                onClick={() => handleSearchChange("")}
+                className="mt-3 text-xs text-stellar-400 hover:text-stellar-300 font-medium cursor-pointer"
+              >
+                {t("transactionList.clearSearch")}
+              </button>
+            )}
+          </div>
+        ) : (
+          visiblePayments.map((tx, index) => {
+            const targetAddress = tx.type === "sent" ? tx.to : tx.from;
+            return (
+              <div
+                key={tx.id}
+                tabIndex={focusedIndex === index ? 0 : -1}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setFocusedIndex((prev) => Math.min(prev + 1, visiblePayments.length - 1));
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setFocusedIndex((prev) => Math.max(prev - 1, 0));
+                  } else if (e.key === 'Enter' && focusedIndex === index) {
+                    e.preventDefault();
+                    const address = tx.type === "sent" ? tx.to : tx.from;
+                    copyToClipboard(address);
+                    setCopiedId(tx.id);
+                    setTimeout(() => setCopiedId(null), 2000);
+                  }
+                }}
+                onBlur={() => setFocusedIndex(-1)}
+                onFocus={() => setFocusedIndex(index)}
+                className={clsx(
+                  "flex items-center gap-3 p-3 rounded-xl bg-white/3 hover:bg-white/5 transition-colors group relative",
+                  focusedIndex === index && "outline-none ring-2 ring-stellar-500 ring-offset-2"
+                )}
+                aria-label={`${tx.type === "sent" ? t("transactionList.sent") : t("transactionList.received")} ${formatAsset(tx.amount, tx.asset)} ${tx.type === "sent" ? t("transactionList.to") : t("transactionList.from")} ${tx.type === "sent" ? tx.to : tx.from}`}
+              >
+                {/* Direction icon */}
+                <div
+                  className={clsx(
+                    "w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0",
+                    tx.type === "sent"
+                      ? "bg-red-500/10 border border-red-500/20"
+                      : "bg-emerald-500/10 border border-emerald-500/20"
+                  )}
+                >
+                  {tx.type === "sent" ? (
+                    <ArrowUpIcon className="w-4 h-4 text-red-400" />
+                  ) : (
+                    <ArrowDownIcon className="w-4 h-4 text-emerald-400" />
+                  )}
+                </div>
+
+                {/* Details */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-slate-200 capitalize">
+                      {tx.type === "sent" ? t("transactionList.sentTo") : t("transactionList.receivedFrom")}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleCopy(
+                          tx.type === "sent" ? tx.to : tx.from,
+                          tx.id
+                        )
+                      }
+                      aria-label={tx.type === "sent" ? t("transactionList.copyRecipientAddress") : t("transactionList.copySenderAddress")}
+                      className="address-pill hover:border-stellar-500/40 transition-colors text-xs cursor-pointer"
+                    >
+                      {copiedId === tx.id
+                        ? t("common.copied")
+                        : shortenAddress(tx.type === "sent" ? tx.to : tx.from, 5)}
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-xs text-slate-500">
+                      {formatRelativeTime(tx.createdAt)}
+                    </span>
+                    {tx.memo && (
+                      <span className="text-xs text-slate-600 truncate max-w-32">
+                        · &ldquo;{tx.memo}&rdquo;
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Private note display (Issue #1189) */}
+                  {notes[tx.transactionHash] && editingNoteHash !== tx.transactionHash && (
+                    <p className="text-xs italic text-slate-500 mt-0.5 truncate max-w-xs">
+                      📝 {notes[tx.transactionHash]}
+                    </p>
+                  )}
+
+                  {/* Inline note editor */}
+                  {editingNoteHash === tx.transactionHash && (
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        value={noteInputValue}
+                        onChange={(e) => setNoteInputValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handleSaveNote(tx.transactionHash);
+                          if (e.key === "Escape") handleCancelEditNote();
+                        }}
+                        placeholder={t("transactionList.notePlaceholder")}
+                        maxLength={200}
+                        autoFocus
+                        className="flex-1 text-xs bg-white/5 border border-white/10 rounded-md px-2 py-1 text-slate-300 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-stellar-500/40"
+                      />
+                      <button
+                        onClick={() => handleSaveNote(tx.transactionHash)}
+                        className="text-xs text-emerald-400 hover:text-emerald-300 px-2 py-1 rounded cursor-pointer"
+                      >
+                        {t("transactionList.save")}
+                      </button>
+                      <button
+                        onClick={handleCancelEditNote}
+                        className="text-xs text-slate-500 hover:text-slate-300 px-1 py-1 rounded cursor-pointer"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Amount + Repeat + Link */}
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <span
+                    className={clsx(
+                      "text-sm font-mono font-medium",
+                      tx.type === "sent" ? "text-red-400" : "text-emerald-400"
+                    )}
+                  >
+                    {tx.type === "sent" ? "-" : "+"}
+                    {formatAsset(tx.amount, tx.asset)}
+                  </span>
+
+                  {/* Add / edit private note button - Issue #1189 */}
+                  {editingNoteHash !== tx.transactionHash && (
+                    <button
+                      onClick={() => handleStartEditNote(tx.transactionHash)}
+                      className="opacity-0 group-hover:opacity-100 transition-opacity text-xs text-slate-400 hover:text-stellar-400 px-1 py-0.5 rounded cursor-pointer"
+                      title={notes[tx.transactionHash] ? t("transactionList.editNote") : t("transactionList.addNote")}
+                      aria-label={notes[tx.transactionHash] ? t("transactionList.editNote") : t("transactionList.addNoteLabel")}
+                    >
+                      {notes[tx.transactionHash] ? "✏️" : "📝"}
+                    </button>
+                  )}
+
+                  {/* Repeat Payment Button (#1187) */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRepeatPayment(tx);
+                    }}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-stellar-400 hover:text-stellar-300 bg-stellar-500/10 hover:bg-stellar-500/20 px-2 py-1 rounded transition-colors whitespace-nowrap cursor-pointer"
+                    title={t("transactionList.repeatTitle")}
+                    aria-label={t("transactionList.repeatPaymentTo", { address: shortenAddress(targetAddress, 4) })}
+                  >
+                    <RepeatIcon className="w-3 h-3" />
+                    {t("transactionList.repeat")}
+                  </button>
+
+                  {onPrintReceipt && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onPrintReceipt(tx);
+                      }}
+                      className="text-slate-500 hover:text-stellar-400 px-1 py-0.5 rounded transition-colors cursor-pointer"
+                      title={t("transactionList.printReceipt")}
+                      aria-label={t("transactionList.printReceiptFor", { hash: tx.transactionHash.slice(0, 8) })}
+                    >
+                      <PrinterIcon className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+
+                  {/* Mint on-chain receipt for eligible sent payments */}
+                  {onMintReceipt && isReceiptEligible(tx, publicKey) && (
+                    mintedReceiptHashes[tx.transactionHash] !== undefined ? (
+                      <span
+                        className="inline-flex items-center text-xs font-medium text-emerald-400 bg-emerald-500/10 px-2 py-1 rounded whitespace-nowrap"
+                        data-testid={`receipt-minted-${tx.id}`}
+                      >
+                        {t("transactionList.receiptNumber", { index: mintedReceiptHashes[tx.transactionHash] })}
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onMintReceipt(tx);
+                        }}
+                        disabled={mintingReceiptHash !== null}
+                        className="inline-flex items-center gap-1 text-xs font-medium text-amber-300 hover:text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 px-2 py-1 rounded transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                        title={t("transactionList.mintReceiptTitle")}
+                        aria-label={t("transactionList.mintReceiptFor", { address: shortenAddress(targetAddress, 4) })}
+                      >
+                        {mintingReceiptHash === tx.transactionHash ? t("transactionList.minting") : t("transactionList.mintReceipt")}
+                      </button>
+                    )
+                  )}
+
+                  <a
+                    href={explorerUrl(tx.transactionHash)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-500 hover:text-stellar-400"
+                    title={t("transactionList.viewOnStellarExpert")}
+                    aria-label={t("transactionList.viewTxOnStellarExpert")}
+                  >
+                    <ExternalLinkIcon className="w-3.5 h-3.5" />
+                  </a>
+                </div>
               </div>
+            );
+          })
+        )}
+
+        {/* Infinite-scroll sentinel (mobile) */}
+        {isMobile && hasMore && payments.length > 0 && (
+          <div
+            ref={sentinelRef}
+            className="flex justify-center py-4"
+            aria-live="polite"
+            aria-label={t("transactionList.loadingMore")}
+          >
+            {loadingMore && (
+              <div className="w-5 h-5 border-2 border-stellar-400 border-t-transparent rounded-full animate-spin" />
             )}
           </div>
         )}
 
-        {/* Load more button (only when NOT using infinite scroll) */}
-        {!infiniteScroll && hasMore && payments.length > 0 && (
-          <div className="flex justify-center mt-4">
+        {/* Pagination fallback (desktop > 768px) */}
+        {!isMobile && hasMore && visiblePayments.length > 0 && (
+          <div className="hidden md:flex justify-center mt-4">
             <button
               onClick={handleLoadMore}
               disabled={loadingMore}
-              className="btn-secondary text-sm py-2 px-6 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="btn-secondary text-sm py-2 px-6 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
               {loadingMore ? (
                 <>
                   <div className="w-4 h-4 border-2 border-stellar-400 border-t-transparent rounded-full animate-spin" />
-                  Loading...
+                  {t("transactionList.loading")}
                 </>
               ) : (
-                hasActiveFilters ? "Load more results" : "Load more"
+                hasActiveFilters ? t("transactionList.loadMoreResults") : t("transactionList.loadMore")
               )}
             </button>
           </div>
         )}
+
+        {/* Privacy disclaimer for local notes — Issue #1189 */}
+        {Object.keys(notes).length > 0 && (
+          <p className="text-xs text-slate-600 text-center mt-4">
+            {t("transactionList.notesDisclaimer")}
+          </p>
+        )}
+      </div>
+
+      {toastVisible && (
+        <Toast
+          message={toastMessage}
+          type="info"
+          onClose={() => {}}
+        />
+      )}
     </div>
   );
 }
 
-export default withErrorBoundary(TransactionList, "TransactionList");
+// ─── Icons ─────────────────────────────────────────────────────────────────────
 
+function HistoryIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  );
+}
+
+function ArrowUpIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 10.5L12 3m0 0l7.5 7.5M12 3v18" />
+    </svg>
+  );
+}
+
+function ArrowDownIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 13.5L12 21m0 0l-7.5-7.5M12 21V3" />
+    </svg>
+  );
+}
+
+function DownloadIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+    </svg>
+  );
+}
+
+function RefreshIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+    </svg>
+  );
+}
+
+function ExternalLinkIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
+    </svg>
+  );
+}
+
+function SearchIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+    </svg>
+  );
+}
+
+function RepeatIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 12c0-1.232-.046-2.453-.138-3.662a4.006 4.006 0 00-3.7-3.7 48.678 48.678 0 00-7.324 0 4.006 4.006 0 00-3.7 3.7c-.017.22-.032.441-.046.662M19.5 12l3-3m-3 3l-3-3m-12 3c0 1.232.046 2.453.138 3.662a4.006 4.006 0 003.7 3.7 48.656 48.656 0 007.324 0 4.006 4.006 0 003.7-3.7c.017-.22.032-.441.046-.662M4.5 12l3 3m-3-3l-3 3" />
+    </svg>
+  );
+}
+
+function CloseIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+    </svg>
+  );
+}
+
+function PrinterIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M6.75 9V3.75A1.75 1.75 0 018.5 2h7a1.75 1.75 0 011.75 1.75V9M7.5 18.75h9M5.25 9H18.75A2.25 2.25 0 0121 11.25v5.25a1.5 1.5 0 01-1.5 1.5h-2.25V15H6.75v3H4.5A1.5 1.5 0 013 16.5v-5.25A2.25 2.25 0 015.25 9z" />
+    </svg>
+  );
+}

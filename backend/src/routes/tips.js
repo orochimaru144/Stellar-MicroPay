@@ -6,11 +6,12 @@
 "use strict";
 
 const express = require("express");
-
 const router = express.Router();
-const tipsController = require("../controllers/tipsController");
 const { strictLimiter } = require("../middleware/rateLimit");
-const { sanitizePublicKey } = require("../middleware/sanitization");
+const { validatePublicKey } = require("../middleware/sanitization");
+const { verifyJWT } = require("../middleware/auth");
+
+const tipsController = require("../controllers/tipsController");
 
 /**
  * POST /api/tips
@@ -22,24 +23,49 @@ router.post("/", strictLimiter, tipsController.recordTip);
  * GET /api/tips/received/:creatorPublicKey
  * Get all tips received by a creator.
  */
-router.get("/received/:creatorPublicKey", strictLimiter, sanitizePublicKey, tipsController.getTipsReceived);
+router.get(
+  "/received/:creatorPublicKey",
+  strictLimiter,
+  validatePublicKey("creatorPublicKey"),
+  tipsController.getTipsReceived
+);
 
 /**
  * GET /api/tips/stats/:creatorPublicKey
  * Get statistics for tips received by a creator.
  */
-router.get("/stats/:creatorPublicKey", strictLimiter, sanitizePublicKey, tipsController.getTipsStats);
+router.get(
+  "/stats/:creatorPublicKey",
+  strictLimiter,
+  validatePublicKey("creatorPublicKey"),
+  tipsController.getTipsStats
+);
 
 /**
  * GET /api/tips/sent/:senderPublicKey
  * Get all tips sent by a user.
  */
-router.get("/sent/:senderPublicKey", strictLimiter, sanitizePublicKey, tipsController.getTipsSent);
+router.get("/sent/:senderPublicKey", strictLimiter, validatePublicKey("senderPublicKey"), tipsController.getTipsSent);
+
+/**
+ * GET/PUT /api/tips/leaderboard/opt-out
+ * Read or change whether the authenticated account appears on public
+ * leaderboards (#1511). Registered before `/leaderboard/:creatorPublicKey`
+ * so "opt-out" is not taken for a public key.
+ */
+router.get("/leaderboard/opt-out", strictLimiter, verifyJWT, tipsController.getLeaderboardOptOut);
+router.put("/leaderboard/opt-out", strictLimiter, verifyJWT, tipsController.setLeaderboardOptOut);
 
 /**
  * GET /api/tips/leaderboard/:creatorPublicKey
  * Get top tippers for a creator.
  */
-router.get("/leaderboard/:creatorPublicKey", strictLimiter, sanitizePublicKey, tipsController.getTopTippers);
+router.get("/leaderboard/:creatorPublicKey", strictLimiter, validatePublicKey("creatorPublicKey"), tipsController.getTopTippers);
+
+/**
+ * GET /api/tips/leaderboard
+ * Get global leaderboard with top recipients and senders.
+ */
+router.get("/leaderboard", strictLimiter, tipsController.getLeaderboard);
 
 module.exports = router;

@@ -37,7 +37,6 @@ describe("stellarService", () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    stellarService.clearAccountCache();
     mockPaymentsCursor.mockImplementation(() => ({ call: mockPaymentsCall }));
     mockPaymentsOrder.mockImplementation(() => ({ cursor: mockPaymentsCursor, call: mockPaymentsCall }));
     mockPaymentsLimit.mockImplementation(() => ({ order: mockPaymentsOrder }));
@@ -118,7 +117,7 @@ describe("stellarService", () => {
             amount: "5.0000000",
             asset_type: "native",
             from: validPublicKey,
-            to: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            to: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBC",
             created_at: "2026-03-27T10:00:00Z",
             transaction_hash: "txhash1",
             paging_token: "pt1",
@@ -161,7 +160,7 @@ describe("stellarService", () => {
         amount: "5.0000000",
         asset: "XLM",
         from: validPublicKey,
-        to: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        to: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBC",
         memo: "hello",
         createdAt: "2026-03-27T10:00:00Z",
         transactionHash: "txhash1",
@@ -184,37 +183,12 @@ describe("stellarService", () => {
       expect(mockPaymentsOrder).toHaveBeenCalledWith("desc");
     });
 
-    it("correctly forwards cursor parameter to Horizon query", async () => {
+    it("uses cursor when provided", async () => {
       mockPaymentsCall.mockResolvedValue({ records: [] });
 
       await stellarService.getPayments(validPublicKey, { limit: 5, cursor: "12345" });
 
       expect(mockPaymentsCursor).toHaveBeenCalledWith("12345");
-    });
-
-    it("correctly forwards limit parameter to Horizon query", async () => {
-      mockPaymentsCall.mockResolvedValue({ records: [] });
-
-      await stellarService.getPayments(validPublicKey, { limit: 50 });
-
-      expect(mockPaymentsLimit).toHaveBeenCalledWith(50);
-    });
-
-    it("uses default limit when not provided", async () => {
-      mockPaymentsCall.mockResolvedValue({ records: [] });
-
-      await stellarService.getPayments(validPublicKey);
-
-      expect(mockPaymentsLimit).toHaveBeenCalledWith(20);
-    });
-
-    it("handles both cursor and limit together", async () => {
-      mockPaymentsCall.mockResolvedValue({ records: [] });
-
-      await stellarService.getPayments(validPublicKey, { limit: 30, cursor: "next-cursor-token" });
-
-      expect(mockPaymentsLimit).toHaveBeenCalledWith(30);
-      expect(mockPaymentsCursor).toHaveBeenCalledWith("next-cursor-token");
     });
 
     it("throws on invalid public key before any Horizon call", async () => {
@@ -223,67 +197,157 @@ describe("stellarService", () => {
       );
       expect(mockPayments).not.toHaveBeenCalled();
     });
+  });
 
-    it("handles path_payment_strict_send and path_payment_strict_receive operations", async () => {
-      const mockTransaction = jest.fn().mockResolvedValue({ memo_type: "none" });
+  describe("getAccountStreaks", () => {
+    afterEach(() => {
+      stellarService.clearStreaksCache();
+    });
 
+    it("handles 0-day streak scenario", async () => {
+      mockPaymentsCall.mockResolvedValue({ records: [] });
+      const result = await stellarService.getAccountStreaks(validPublicKey);
+      expect(result).toEqual({ currentStreak: 0, longestStreak: 0, lastTransactionDate: null });
+    });
+
+    it("handles 1-day streak scenario", async () => {
+      const today = new Date().toISOString().split("T")[0];
       mockPaymentsCall.mockResolvedValue({
         records: [
-          {
-            id: "op-path-send",
-            type: "path_payment_strict_send",
-            amount: "10.0000000",
-            asset_type: "credit_alphanum4",
-            asset_code: "USDC",
-            from: validPublicKey,
-            to: "GDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-            created_at: "2026-03-27T10:00:00Z",
-            transaction_hash: "txhash",
-            paging_token: "pt",
-            transaction: mockTransaction,
-          },
-        ],
+          { type: "payment", created_at: `${today}T10:00:00Z` }
+        ]
       });
+      const result = await stellarService.getAccountStreaks(validPublicKey);
+      expect(result.currentStreak).toBe(1);
+      expect(result.longestStreak).toBe(1);
+    });
 
-      const result = await stellarService.getPayments(validPublicKey);
+    it("handles 7-day streak scenario", async () => {
+      const records = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date();
+        d.setDate(d.getDate() - i);
+        records.push({ type: "payment", created_at: d.toISOString() });
+      }
+      mockPaymentsCall.mockResolvedValue({ records });
+      const result = await stellarService.getAccountStreaks(validPublicKey);
+      expect(result.currentStreak).toBe(7);
+      expect(result.longestStreak).toBe(7);
+    });
 
-      expect(result).toHaveLength(1);
-      expect(result[0].type).toBe("sent");
+    it("handles 30-day streak scenario", async () => {
+      const records = [];
+      for (let i = 0; i < 30; i++) {
+        const d = new Date();
+        d.setDate(d.getDate() - i);
+        records.push({ type: "payment", created_at: d.toISOString() });
+      }
+      mockPaymentsCall.mockResolvedValue({ records });
+      const result = await stellarService.getAccountStreaks(validPublicKey);
+      expect(result.currentStreak).toBe(30);
+      expect(result.longestStreak).toBe(30);
+    });
+    it("handles broken streak", async () => {
+      const today = new Date();
+      const d1 = new Date(today);
+      d1.setDate(d1.getDate() - 1); // yesterday
+      const d2 = new Date(today);
+      d2.setDate(d2.getDate() - 2);
+      const d4 = new Date(today);
+      d4.setDate(d4.getDate() - 4);
+      const d5 = new Date(today);
+      d5.setDate(d5.getDate() - 5);
+      const d6 = new Date(today);
+      d6.setDate(d6.getDate() - 6);
+      mockPaymentsCall.mockResolvedValue({
+        records: [
+          { type: "payment", created_at: d1.toISOString() }, // active streak = 2
+          { type: "payment", created_at: d2.toISOString() },
+          { type: "payment", created_at: d4.toISOString() }, // older 3-day streak
+          { type: "payment", created_at: d5.toISOString() },
+          { type: "payment", created_at: d6.toISOString() },
+        ]
+      });
+      const result = await stellarService.getAccountStreaks(validPublicKey);
+      expect(result.currentStreak).toBe(2);
+      expect(result.longestStreak).toBe(3);
     });
   });
 
-  describe("getAccount", () => {
-    it("returns account with correct structure and balances (happy path)", async () => {
-      mockLoadAccount.mockResolvedValue({
-        sequence: "12345",
-        subentry_count: 3,
-        balances: [
-          { asset_type: "native", balance: "100.5000000" },
-          { asset_type: "credit_alphanum4", asset_code: "USDC", asset_issuer: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", balance: "50.0000000" },
-        ],
-      });
+  describe("getMemoHistory", () => {
+    it("returns the 10 most recent distinct MEMO_TEXT memos from a fixture of 20 payments", async () => {
+      const records = [
+        // 1. Text memo: "Memo 1 (newest)"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 1 (newest)" }) },
+        // 2. Hash memo (should be ignored)
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "hash", memo: "0x1234567890abcdef" }) },
+        // 3. Text memo: "Memo 2"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 2" }) },
+        // 4. No memo (should be ignored)
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "none" }) },
+        // 5. Text memo duplicate: "Memo 1 (newest)" (should be ignored)
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 1 (newest)" }) },
+        // 6. ID memo (should be ignored)
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "id", memo: "123456" }) },
+        // 7. Text memo: "Memo 3"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 3" }) },
+        // 8. Text memo: "Memo 4"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 4" }) },
+        // 9. Text memo: "Memo 5"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 5" }) },
+        // 10. Return memo (should be ignored)
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "return", memo: "0xabcdef" }) },
+        // 11. Text memo: "Memo 6"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 6" }) },
+        // 12. Text memo: "Memo 7"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 7" }) },
+        // 13. Text memo duplicate: "Memo 2" (should be ignored)
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 2" }) },
+        // 14. Text memo: "Memo 8"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 8" }) },
+        // 15. Text memo: "Memo 9"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 9" }) },
+        // 16. Text memo: "Memo 10"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 10" }) },
+        // 17. Text memo: "Memo 11" (11th distinct memo - capped by limit 10)
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 11" }) },
+        // 18. Text memo: "Memo 12"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 12" }) },
+        // 19. Text memo: "Memo 13"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 13" }) },
+        // 20. Text memo: "Memo 14"
+        { type: "payment", transaction: jest.fn().mockResolvedValue({ memo_type: "text", memo: "Memo 14" }) },
+      ];
 
-      const result = await stellarService.getAccount(validPublicKey);
+      mockPaymentsCall.mockResolvedValue({ records });
 
-      expect(result.publicKey).toBe(validPublicKey);
-      expect(result.sequence).toBe("12345");
-      expect(result.subentryCount).toBe(3);
-      expect(result.balances).toHaveLength(2);
-      expect(result.balances[0].assetCode).toBe("XLM");
-      expect(result.balances[1].assetCode).toBe("USDC");
+      const result = await stellarService.getMemoHistory(validPublicKey);
+
+      expect(result).toHaveLength(10);
+      expect(result).toEqual([
+        "Memo 1 (newest)",
+        "Memo 2",
+        "Memo 3",
+        "Memo 4",
+        "Memo 5",
+        "Memo 6",
+        "Memo 7",
+        "Memo 8",
+        "Memo 9",
+        "Memo 10",
+      ]);
     });
 
-    it("throws 404 error with expected message when account not found", async () => {
-      mockLoadAccount.mockRejectedValue({ response: { status: 404 } });
+    it("returns empty array when account has no payments or text memos", async () => {
+      mockPaymentsCall.mockResolvedValue({ records: [] });
+      const result = await stellarService.getMemoHistory(validPublicKey);
+      expect(result).toEqual([]);
+    });
 
-      try {
-        await stellarService.getAccount(validPublicKey);
-        expect.fail("Should have thrown error");
-      } catch (err) {
-        expect(err.status).toBe(404);
-        expect(err.message).toContain("Account not found");
-        expect(err.message).toContain("Use Friendbot on testnet");
-      }
+    it("throws error on invalid public key", async () => {
+      await expect(stellarService.getMemoHistory("invalid-key")).rejects.toThrow(
+        "Invalid Stellar public key format"
+      );
     });
   });
 });

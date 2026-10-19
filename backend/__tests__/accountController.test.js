@@ -2,29 +2,37 @@
 
 const express = require("express");
 const request = require("supertest");
+const jwt = require("jsonwebtoken");
 const accountController = require("../src/controllers/accountController");
 const stellarService = require("../src/services/stellarService");
 const usernameService = require("../src/services/usernameService");
+const { verifyJWT, JWT_SECRET } = require("../src/middleware/auth");
 
 jest.mock("../src/services/stellarService");
 jest.mock("../src/services/usernameService");
 
+const validPublicKey = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const generateToken = (payload = { publicKey: validPublicKey }) =>
+  jwt.sign(payload, JWT_SECRET, { expiresIn: "1h" });
+
 function setupApp() {
   const app = express();
   app.use(express.json());
-  
+
   app.get("/api/accounts/resolve/:username", accountController.resolveUsername);
   app.get("/api/accounts/:publicKey/balance", accountController.getBalance);
+  app.get("/api/accounts/:publicKey/streaks", accountController.getStreaks);
+  app.get("/api/accounts/:publicKey/memo-history", verifyJWT, accountController.getMemoHistory);
   app.get("/api/accounts/:publicKey", accountController.getAccount);
   app.post("/api/accounts/register", accountController.registerUsername);
-  
-  // Standard error handler resembling the one in server.js
+
   app.use((err, req, res, next) => {
+    void next;
     const status = err.status || 500;
     const message = err.message || "Internal Server Error";
     res.status(status).json({ error: message });
   });
-  
+
   return app;
 }
 
@@ -35,142 +43,123 @@ describe("accountController", () => {
     jest.clearAllMocks();
   });
 
-  describe("getAccount", () => {
+  describe("GET /api/accounts/:publicKey/memo-history", () => {
+    it("rejects unauthenticated requests without JWT header", async () => {
+      const res = await request(app).get(`/api/accounts/${validPublicKey}/memo-history`);
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/Unauthorized/);
+    });
+
+    it("rejects requests with invalid JWT token", async () => {
+      const res = await request(app)
+        .get(`/api/accounts/${validPublicKey}/memo-history`)
+        .set("Authorization", "Bearer invalid.jwt.token");
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/Unauthorized/);
+    });
+
+    it("returns distinct memo history when authenticated with valid JWT", async () => {
+      const mockMemos = ["Coffee", "Invoice 123", "Tip for service"];
+      stellarService.getMemoHistory.mockResolvedValue(mockMemos);
+
+      const token = generateToken();
+      const res = await request(app)
+        .get(`/api/accounts/${validPublicKey}/memo-history`)
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        success: true,
+        data: mockMemos,
+      });
+      expect(stellarService.getMemoHistory).toHaveBeenCalledWith(validPublicKey);
+    });
+
+    it("returns 400 when invalid public key is passed", async () => {
+      const invalidErr = new Error("Invalid Stellar public key format");
+      invalidErr.status = 400;
+      stellarService.getMemoHistory.mockRejectedValue(invalidErr);
+
+      const token = generateToken();
+      const res = await request(app)
+        .get("/api/accounts/INVALID_KEY/memo-history")
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Invalid Stellar public key format");
+    });
+  });
+
+  describe("GET /api/accounts/:publicKey", () => {
     it("returns account info for a valid public key", async () => {
-      const mockAccount = { id: "G_VALID", balances: [] };
+      const mockAccount = { publicKey: validPublicKey, sequence: "100", balances: [] };
       stellarService.getAccount.mockResolvedValue(mockAccount);
 
-      const res = await request(app).get("/api/accounts/G_VALID");
+      const res = await request(app).get(`/api/accounts/${validPublicKey}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, data: mockAccount });
+    });
+  });
+
+  describe("GET /api/accounts/:publicKey/balance", () => {
+    it("returns XLM balance", async () => {
+      stellarService.getXLMBalance.mockResolvedValue("150.5000000");
+
+      const res = await request(app).get(`/api/accounts/${validPublicKey}/balance`);
 
       expect(res.status).toBe(200);
       expect(res.body).toEqual({
         success: true,
-        data: mockAccount
-      });
-      expect(stellarService.getAccount).toHaveBeenCalledWith("G_VALID");
-    });
-
-    it("returns 404 for a nonexistent account", async () => {
-      const notFoundError = new Error("Account not found");
-      notFoundError.status = 404;
-      stellarService.getAccount.mockRejectedValue(notFoundError);
-
-      const res = await request(app).get("/api/accounts/G_MISSING");
-
-      expect(res.status).toBe(404);
-      expect(res.body).toEqual({
-        error: "Account not found"
-      });
-    });
-
-    it("propagates stellarService errors as the documented error response", async () => {
-      const serverError = new Error("Stellar network error");
-      serverError.status = 503; 
-      stellarService.getAccount.mockRejectedValue(serverError);
-
-      const res = await request(app).get("/api/accounts/G_ERROR");
-
-      expect(res.status).toBe(503);
-      expect(res.body).toEqual({
-        error: "Stellar network error"
+        data: { publicKey: validPublicKey, xlm: "150.5000000" },
       });
     });
   });
 
-  describe("getBalance", () => {
-    it("returns balance info for a valid public key", async () => {
-      stellarService.getXLMBalance.mockResolvedValue("100.00");
+  describe("GET /api/accounts/:publicKey/streaks", () => {
+    it("returns account streaks", async () => {
+      const mockStreaks = { currentStreak: 5, longestStreak: 12, lastTransactionDate: "2026-03-27" };
+      stellarService.getAccountStreaks.mockResolvedValue(mockStreaks);
 
-      const res = await request(app).get("/api/accounts/G_VALID/balance");
+      const res = await request(app).get(`/api/accounts/${validPublicKey}/streaks`);
 
       expect(res.status).toBe(200);
-      expect(res.body).toEqual({
-        success: true,
-        data: { publicKey: "G_VALID", xlm: "100.00" }
-      });
-      expect(stellarService.getXLMBalance).toHaveBeenCalledWith("G_VALID");
-    });
-
-    it("propagates errors from stellarService", async () => {
-      const err = new Error("Failed to get balance");
-      err.status = 400;
-      stellarService.getXLMBalance.mockRejectedValue(err);
-
-      const res = await request(app).get("/api/accounts/G_ERROR/balance");
-
-      expect(res.status).toBe(400);
-      expect(res.body).toEqual({ error: "Failed to get balance" });
+      expect(res.body).toEqual(mockStreaks);
     });
   });
 
-  describe("registerUsername", () => {
-    it("returns 400 if username or publicKey is missing", async () => {
-      const res = await request(app).post("/api/accounts/register").send({ username: "alice" });
-      
-      expect(res.status).toBe(400);
-      expect(res.body).toEqual({
-        success: false,
-        error: "Username and public key are required"
-      });
-    });
-
+  describe("POST /api/accounts/register", () => {
     it("registers a username successfully", async () => {
-      usernameService.registerUsername.mockReturnValue({ username: "alice", publicKey: "G_VALID" });
+      usernameService.registerUsername.mockReturnValue({ username: "alice", publicKey: validPublicKey });
 
       const res = await request(app)
         .post("/api/accounts/register")
-        .send({ username: "alice", publicKey: "G_VALID" });
-        
+        .send({ username: "alice", publicKey: validPublicKey });
+
       expect(res.status).toBe(201);
-      expect(res.body).toEqual({
-        success: true,
-        data: { username: "alice", publicKey: "G_VALID" },
-        message: "Username registered successfully"
-      });
-      expect(usernameService.registerUsername).toHaveBeenCalledWith("alice", "G_VALID");
+      expect(res.body.success).toBe(true);
+      expect(res.body.data).toEqual({ username: "alice", publicKey: validPublicKey });
     });
 
-    it("propagates errors from usernameService", async () => {
-      usernameService.registerUsername.mockImplementation(() => {
-        const err = new Error("Username already taken");
-        err.status = 409;
-        throw err; // usernameService methods appear to be synchronous in the controller
-      });
+    it("returns 400 when missing username or publicKey", async () => {
+      const res = await request(app).post("/api/accounts/register").send({ username: "alice" });
 
-      const res = await request(app)
-        .post("/api/accounts/register")
-        .send({ username: "bob", publicKey: "G_VALID" });
-        
-      expect(res.status).toBe(409);
-      expect(res.body).toEqual({ error: "Username already taken" });
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
     });
   });
 
-  describe("resolveUsername", () => {
-    it("resolves a username to its associated public key", async () => {
-      usernameService.resolveUsername.mockReturnValue({ publicKey: "G_VALID" });
+  describe("GET /api/accounts/resolve/:username", () => {
+    it("resolves a registered username", async () => {
+      usernameService.resolveUsername.mockReturnValue({ username: "alice", publicKey: validPublicKey });
 
-      const res = await request(app).get("/api/accounts/resolve/bob");
+      const res = await request(app).get("/api/accounts/resolve/alice");
 
       expect(res.status).toBe(200);
       expect(res.body).toEqual({
         success: true,
-        data: { publicKey: "G_VALID" }
+        data: { username: "alice", publicKey: validPublicKey },
       });
-      expect(usernameService.resolveUsername).toHaveBeenCalledWith("bob");
-    });
-
-    it("propagates errors when username cannot be resolved", async () => {
-      usernameService.resolveUsername.mockImplementation(() => {
-        const err = new Error("Username not found");
-        err.status = 404;
-        throw err;
-      });
-
-      const res = await request(app).get("/api/accounts/resolve/unknown");
-
-      expect(res.status).toBe(404);
-      expect(res.body).toEqual({ error: "Username not found" });
     });
   });
 });

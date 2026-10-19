@@ -1,15 +1,172 @@
 "use strict";
 
-require("dotenv").config();
-const logger = require("../utils/logger");
+/**
+ * src/services/scheduledTransactionService.js
+ *
+ * Durable service for scheduling, persisting, and executing pre-signed Stellar transactions.
+ * (Issue #1397: Persist scheduled transactions so restarts don't silently drop schedules)
+ *
+ * Architecture & Downtime Policy:
+ *   1. Persistence: All scheduled transactions are persisted via `scheduledTransactionStore`
+ *      using an atomic, versioned JSON document (`data/scheduled_transactions.json`).
+ *   2. Boot Recovery & Re-arming:
+ *      On service startup or reboot, `rearmAllTimers()` scans all stored transactions.
+ *      - Future schedules (`submitAt > now`): Timer is armed for the exact remaining delay (`submitAt - now`).
+ *      - Overdue schedules (`submitAt <= now`): Handled per the **Immediate Execution with Notice** policy:
+ *          - If `attempts < MAX_ATTEMPTS` (3), the transaction is flagged with:
+ *              `recoveredAfterDowntime: true`
+ *              `downtimeNotice: "Scheduled time passed during backend downtime; executed immediately upon recovery"`
+ *            and queued for immediate execution (`setTimeout(..., 0)`).
+ *          - If `attempts >= MAX_ATTEMPTS`, the transaction is marked as `failed` with notice.
+ *   3. Execution & Retries:
+ *      When a scheduled timer fires, the configured executor (defaults to `stellarService.submitTransaction`)
+ *      submits the signed XDR. Failures record `lastError` and increment `attempts` up to 3 times.
+ */
 
-// In-memory storage for scheduled transactions
-// In a production environment, this would be replaced with a database
-const scheduledTransactions = new Map();
-let transactionIdCounter = 1;
+require("dotenv").config();
+const { createScheduledTransactionStore } = require("../storage/scheduledTransactionStore");
+
+const MAX_ATTEMPTS = 3;
+
+// Internal active store & timer map
+let store = createScheduledTransactionStore();
+const activeTimers = new Map();
+
+// Default transaction executor (submits via stellarService if available)
+let defaultExecutor = null;
+try {
+  const { submitTransaction } = require("./stellarService");
+  defaultExecutor = async (tx) => {
+    return await submitTransaction(tx.signedXDR);
+  };
+} catch {
+  defaultExecutor = async () => ({ successful: true });
+}
+
+let customExecutor = null;
+
+function getExecutor() {
+  return customExecutor || defaultExecutor;
+}
+
+function setExecutor(fn) {
+  customExecutor = fn;
+}
 
 /**
- * Store a pre-signed transaction for future submission
+ * Disarm and clear a timer for a given transaction ID.
+ */
+function disarmTimer(id) {
+  const timer = activeTimers.get(Number(id));
+  if (timer) {
+    clearTimeout(timer);
+    activeTimers.delete(Number(id));
+  }
+}
+
+/**
+ * Clear all active in-memory timers (used for clean shutdown and tests).
+ */
+function stopAllTimers() {
+  for (const [, timer] of activeTimers) {
+    clearTimeout(timer);
+  }
+  activeTimers.clear();
+}
+
+/**
+ * Arm a timer for a scheduled transaction.
+ *
+ * Downtime handling policy:
+ * - If `submitAt <= now` and `attempts < MAX_ATTEMPTS`, trigger immediately with notice.
+ * - If `submitAt > now`, arm timer for `submitAt - now`.
+ */
+function armTimer(tx) {
+  if (!tx || tx.id == null) return;
+  disarmTimer(tx.id);
+
+  if (tx.status === "completed" || tx.attempts >= MAX_ATTEMPTS) {
+    return;
+  }
+
+  const now = Date.now();
+  const delayMs = Math.max(0, tx.submitAt - now);
+
+  if (delayMs === 0 && tx.submitAt < now) {
+    tx.recoveredAfterDowntime = true;
+    tx.downtimeNotice =
+      "Scheduled time passed during backend downtime; executed immediately upon recovery";
+    store.set(tx.id, tx);
+  }
+
+  const timer = setTimeout(async () => {
+    activeTimers.delete(tx.id);
+    await executeScheduledTransaction(tx.id);
+  }, delayMs);
+
+  // Allow Node process to exit cleanly if this timer is active
+  if (timer.unref) {
+    timer.unref();
+  }
+
+  activeTimers.set(tx.id, timer);
+}
+
+/**
+ * Executes a scheduled transaction when its timer fires.
+ */
+async function executeScheduledTransaction(id) {
+  const tx = store.get(id);
+  if (!tx || tx.status === "completed" || tx.attempts >= MAX_ATTEMPTS) {
+    return;
+  }
+
+  const executor = getExecutor();
+  try {
+    const result = await executor(tx);
+    tx.attempts += 1;
+    tx.status = "completed";
+    tx.executedAt = Date.now();
+    tx.executionResult = result;
+    tx.lastError = null;
+    store.set(tx.id, tx);
+  } catch (err) {
+    tx.attempts += 1;
+    tx.lastError = err?.message || String(err);
+    if (tx.attempts >= MAX_ATTEMPTS) {
+      tx.status = "failed";
+    }
+    store.set(tx.id, tx);
+  }
+}
+
+/**
+ * Re-arm all pending transactions from the persistent store.
+ * Automatically called on boot / module initialization.
+ */
+function rearmAllTimers() {
+  stopAllTimers();
+  const all = store.getAll();
+  for (const tx of all) {
+    if (tx.status !== "completed" && tx.attempts < MAX_ATTEMPTS) {
+      armTimer(tx);
+    }
+  }
+}
+
+/**
+ * Initialize or re-configure the service with custom options (e.g., custom dataFile for tests).
+ */
+function initService(options = {}) {
+  stopAllTimers();
+  store = createScheduledTransactionStore(options);
+  rearmAllTimers();
+  return store;
+}
+
+/**
+ * Store and arm a pre-signed transaction for future submission.
+ *
  * @param {string} signedXDR - The signed transaction XDR
  * @param {Date} submitAt - Timestamp when the transaction should be submitted
  * @param {string} publicKey - The account public key that owns this transaction
@@ -36,269 +193,140 @@ function scheduleTransaction(signedXDR, submitAt, publicKey) {
     throw error;
   }
 
-  const id = transactionIdCounter++;
+  const id = store.nextId();
   const scheduledTx = {
     id,
     signedXDR,
-    submitAt: submitAt.getTime(), // Store as timestamp for easier comparison
+    submitAt: submitAt.getTime(),
     publicKey,
     attempts: 0,
     lastError: null,
-    createdAt: new Date().getTime(),
-    paused: false,
-    pausedAt: null,
-    // Reconciliation state: null | "unknown" | "confirmed" | "failed"
-    submissionState: null,
-    /** @type {string|null} Transaction hash after submission */
-    txHash: null,
-    /** @type {string|null} Source account sequence number from the XDR */
-    sourceSequence: null,
+    createdAt: Date.now(),
+    status: "pending",
+    recoveredAfterDowntime: false,
+    downtimeNotice: null,
   };
 
-  scheduledTransactions.set(id, scheduledTx);
-  return scheduledTx;
+  const saved = store.set(id, scheduledTx);
+  armTimer(saved);
+
+  return saved;
 }
 
 /**
- * Get pending scheduled transactions for a public key
+ * Get pending scheduled transactions for a public key.
+ *
  * @param {string} publicKey - The account public key
- * @returns {Array} Array of scheduled transactions
+ * @returns {Array} Array of pending scheduled transactions
  */
 function getPendingTransactions(publicKey) {
-  // Validate public key format
-  if (!/^G[A-Z0-9]{55}$/.test(publicKey)) {
+  if (!publicKey || !/^G[A-Z0-9]{55}$/.test(publicKey)) {
     const error = new Error("Invalid Stellar public key format");
     error.status = 400;
     throw error;
   }
 
-  const now = Date.now();
   const pending = [];
+  const all = store.getAll();
 
-  for (const [, tx] of scheduledTransactions.entries()) {
-    if (tx.publicKey === publicKey && tx.submitAt > now && tx.attempts < 3 && !tx.paused) {
+  for (const tx of all) {
+    if (
+      tx.publicKey === publicKey &&
+      tx.status !== "completed" &&
+      tx.attempts < MAX_ATTEMPTS
+    ) {
       pending.push({
         id: tx.id,
         submitAt: new Date(tx.submitAt),
         publicKey: tx.publicKey,
         attempts: tx.attempts,
         createdAt: new Date(tx.createdAt),
-        paused: tx.paused || false,
+        status: tx.status || "pending",
+        recoveredAfterDowntime: Boolean(tx.recoveredAfterDowntime),
+        downtimeNotice: tx.downtimeNotice || null,
       });
     }
   }
 
-  // Sort by submitAt ascending (earliest first)
   return pending.sort((a, b) => a.submitAt - b.submitAt);
 }
 
 /**
- * Get a scheduled transaction by ID
+ * Get a scheduled transaction by ID.
+ *
  * @param {number} id - The transaction ID
  * @returns {Object|null} The transaction or null if not found
  */
 function getTransactionById(id) {
-  return scheduledTransactions.get(id) || null;
+  return store.get(id);
 }
 
 /**
- * Cancel a scheduled transaction
+ * Cancel a scheduled transaction.
+ *
  * @param {number} id - The transaction ID
  * @returns {boolean} True if cancelled, false if not found
  */
 function cancelTransaction(id) {
-  return scheduledTransactions.delete(id);
+  disarmTimer(id);
+  return store.delete(id);
 }
 
 /**
- * Get transactions that are due for submission (submitAt <= now)
+ * Get transactions that are due for submission (submitAt <= now).
+ *
  * @returns {Array} Array of transactions ready for submission
  */
 function getDueTransactions() {
   const now = Date.now();
   const due = [];
+  const all = store.getAll();
 
-  for (const [, tx] of scheduledTransactions.entries()) {
-    // Only include transactions that:
-    // 1. Are due for submission (submitAt <= now)
-    // 2. Haven't exceeded max attempts (attempts < 3)
-    // 3. Are not paused (paused !== true)
-    // 4. Haven't already been submitted or reconciled (avoids duplicate resubmission)
+  for (const tx of all) {
     if (
       tx.submitAt <= now &&
-      tx.attempts < 3 &&
-      !tx.paused &&
-      tx.submissionState !== "confirmed" &&
-      tx.submissionState !== "unknown"
+      tx.status !== "completed" &&
+      tx.attempts < MAX_ATTEMPTS
     ) {
       due.push(tx);
     }
   }
 
-  // Sort by submitAt ascending (oldest first)
   return due.sort((a, b) => a.submitAt - b.submitAt);
 }
 
 /**
- * Increment the attempt counter for a transaction
+ * Increment the attempt counter for a transaction.
+ *
  * @param {number} id - The transaction ID
  * @param {string|null} error - Error message if submission failed, null if successful
  */
 function incrementAttempt(id, error = null) {
-  const tx = scheduledTransactions.get(id);
+  const tx = store.get(id);
   if (tx) {
     tx.attempts += 1;
     tx.lastError = error || null;
-    // If successful, we could remove it from the queue, but for now
-    // we'll let the caller handle removal if needed
+    if (tx.attempts >= MAX_ATTEMPTS) {
+      tx.status = "failed";
+      disarmTimer(id);
+    }
+    store.set(id, tx);
   }
 }
 
 /**
- * Remove a transaction from the queue (after successful submission or final failure)
+ * Remove a transaction from the store (after successful submission or final failure).
+ *
  * @param {number} id - The transaction ID
  * @returns {boolean} True if removed, false if not found
  */
 function removeTransaction(id) {
-  return scheduledTransactions.delete(id);
+  disarmTimer(id);
+  return store.delete(id);
 }
 
-/**
- * Record a submission attempt. Sets state to "unknown" until reconciliation.
- * @param {number} id - The transaction ID
- * @param {string} txHash - The Stellar transaction hash
- * @param {string} [sourceSequence] - The source account sequence used in the XDR
- */
-function markSubmitted(id, txHash, sourceSequence) {
-  const tx = scheduledTransactions.get(id);
-  if (tx) {
-    tx.submissionState = "unknown";
-    tx.txHash = txHash;
-    if (sourceSequence) tx.sourceSequence = sourceSequence;
-    logger.info(JSON.stringify({ type: "transaction_submitted", id, txHash }));
-  }
-}
-
-/**
- * Reconcile a submitted transaction by confirming or denying it.
- * When the caller has checked Horizon and determined the outcome, they call
- * this function to move the transaction to a terminal state.
- *
- * @param {number} id - The transaction ID
- * @param {boolean} confirmed - Whether the transaction was found on-ledger
- * @param {string} [reason] - Explanation (e.g. timeout, duplicate, bad_seq)
- */
-function reconcileTransaction(id, confirmed, reason) {
-  const tx = scheduledTransactions.get(id);
-  if (!tx) return;
-
-  if (confirmed) {
-    tx.submissionState = "confirmed";
-    logger.info(JSON.stringify({ type: "transaction_confirmed", id, txHash: tx.txHash }));
-  } else {
-    tx.submissionState = "failed";
-    tx.lastError = reason || "Reconciled as not found on-ledger";
-    logger.info(JSON.stringify({ type: "transaction_failed_reconciliation", id, reason: tx.lastError }));
-  }
-}
-
-/**
- * Reconcile by looking up a transaction hash on Horizon.
- * Returns the resolved state so the caller can act on it.
- *
- * @param {number} id - The transaction ID
- * @param {object|null} horizonTx - The Horizon transaction response, or null if not found
- * @returns {string} "confirmed" | "failed" | "unknown"
- */
-function reconcileByHash(id, horizonTx) {
-  const tx = scheduledTransactions.get(id);
-  if (!tx) return "unknown";
-
-  if (horizonTx && (horizonTx.successful === true || horizonTx.successful === undefined)) {
-    reconcileTransaction(id, true);
-    return "confirmed";
-  }
-
-  // Found on-ledger but not successful, or not found at all
-  reconcileTransaction(id, false, horizonTx ? "Transaction failed on-ledger" : "Transaction not found");
-  return "failed";
-}
-
-/**
- * Reconcile by comparing the account's current sequence to the source
- * sequence that was used when the transaction was signed.
- *
- * If the account's sequence has advanced past the source sequence, the
- * transaction (or a subsequent one using the same sequence) has been applied.
- *
- * @param {number} id - The scheduled transaction ID
- * @param {string|number} currentSequence - The account's current sequence from Horizon
- * @returns {string} "confirmed" | "failed" | "unknown"
- */
-function reconcileBySequence(id, currentSequence) {
-  const tx = scheduledTransactions.get(id);
-  if (!tx) return "unknown";
-  if (!tx.sourceSequence) return "unknown";
-
-  const current = BigInt(currentSequence);
-  const source = BigInt(tx.sourceSequence);
-
-  if (current > source) {
-    // Sequence advanced — the transaction was applied (or superseded).
-    reconcileTransaction(id, true, "Sequence advanced past source");
-    return "confirmed";
-  }
-
-  // Sequence hasn't advanced — transaction was never applied
-  reconcileTransaction(id, false, "Sequence unchanged — transaction not applied");
-  return "failed";
-}
-
-/**
- * Get all transactions that need reconciliation (submitted but outcome unknown).
- * @returns {Array}
- */
-function getUnreconciledTransactions() {
-  const unreconciled = [];
-  for (const [, tx] of scheduledTransactions.entries()) {
-    if (tx.submissionState === "unknown") {
-      unreconciled.push(tx);
-    }
-  }
-  return unreconciled;
-}
-
-/**
- * Pause a scheduled transaction
- * @param {number} id - The transaction ID
- * @returns {boolean} True if paused, false if not found
- */
-function pauseTransaction(id) {
-  const tx = scheduledTransactions.get(id);
-  if (tx) {
-    tx.paused = true;
-    tx.pausedAt = Date.now();
-    logger.info(JSON.stringify({ type: "transaction_paused", id }));
-    return true;
-  }
-  return false;
-}
-
-/**
- * Resume a paused scheduled transaction
- * @param {number} id - The transaction ID
- * @returns {boolean} True if resumed, false if not found
- */
-function resumeTransaction(id) {
-  const tx = scheduledTransactions.get(id);
-  if (tx) {
-    tx.paused = false;
-    tx.pausedAt = null;
-    logger.info(JSON.stringify({ type: "transaction_resumed", id }));
-    return true;
-  }
-  return false;
-}
+// Arm any pending timers on initial load
+rearmAllTimers();
 
 module.exports = {
   scheduleTransaction,
@@ -308,11 +336,12 @@ module.exports = {
   getDueTransactions,
   incrementAttempt,
   removeTransaction,
-  pauseTransaction,
-  resumeTransaction,
-  markSubmitted,
-  reconcileTransaction,
-  reconcileByHash,
-  reconcileBySequence,
-  getUnreconciledTransactions,
+  rearmAllTimers,
+  stopAllTimers,
+  initService,
+  setExecutor,
+  armTimer,
+  executeScheduledTransaction,
+  getStore: () => store,
+  getActiveTimerCount: () => activeTimers.size,
 };

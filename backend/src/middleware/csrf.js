@@ -1,69 +1,126 @@
 /**
  * src/middleware/csrf.js
- * Origin verification for cookie-authenticated, state-changing requests (#780).
+ * CSRF protection using the double-submit cookie pattern.
  *
- * SameSite=Strict on the `jwt` cookie is useful defense-in-depth, but it isn't
- * sufficient on its own (some browsers/extensions relax SameSite handling, and
- * relying on a single header is fragile). This middleware adds an explicit
- * check: any request that would authenticate via the `jwt` cookie must also
- * present an Origin (or Referer, as a fallback for older/non-fetch clients)
- * header naming one of our own allowed origins.
+ * The companion analysis in `./auth.js` explains why the stateless SEP-0010
+ * bearer-token flow is already CSRF-resistant; this middleware adds the
+ * defence-in-depth layer requested by the security issue.
  *
- * Non-browser / bearer-token flows are unaffected: a request carrying an
- * `Authorization: Bearer <token>` header never relies on the ambient cookie,
- * so it is not a CSRF target and skips this check entirely.
+ * How the double-submit cookie pattern works here
+ * -----------------------------------------------------------------------------
+ * 1. The server hands the browser a cryptographically random token in a
+ *    *readable* (non-httpOnly) cookie: `csrfToken`.
+ * 2. The client echoes that token back in the `X-CSRF-Token` header on every
+ *    state-changing request.
+ * 3. A forged cross-site request is unable to read the cookie (same-origin
+ *    policy) and therefore cannot produce a matching header, so the request is
+ *    rejected — even though the browser may still have attached its cookies.
+ *
+ * Scope
+ * -----------------------------------------------------------------------------
+ * CSRF only exists where the browser attaches credentials automatically
+ * (cookies). Requests that carry no cookies are stateless/bearer clients that
+ * are not CSRF-susceptible, so they are allowed through untouched.
  */
 "use strict";
 
-const { parseAllowedOrigins } = require("../config/validateEnv");
+const crypto = require("crypto");
 
-function hasBearerToken(req) {
-  const authHeader = req.headers.authorization;
-  return typeof authHeader === "string" && authHeader.startsWith("Bearer ");
+const CSRF_COOKIE = "csrfToken";
+const CSRF_HEADER = "x-csrf-token";
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * Parse a raw `Cookie` header into a plain object.
+ * Kept dependency-free so the security fix adds no new supply-chain surface.
+ */
+function parseCookies(cookieHeader) {
+  const cookies = {};
+  if (!cookieHeader) return cookies;
+
+  for (const pair of cookieHeader.split(";")) {
+    const separator = pair.indexOf("=");
+    if (separator === -1) continue;
+    const key = pair.slice(0, separator).trim();
+    const value = pair.slice(separator + 1).trim();
+    if (key) {
+      try {
+        cookies[key] = decodeURIComponent(value);
+      } catch {
+        cookies[key] = value;
+      }
+    }
+  }
+
+  return cookies;
 }
 
-function originFromReferer(referer) {
-  try {
-    return new URL(referer).origin;
-  } catch {
-    return null;
-  }
+/** Generate a cryptographically strong, URL-safe CSRF token. */
+function generateCsrfToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+/** Constant-time comparison that tolerates mismatched lengths. */
+function tokensMatch(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**
- * Build the CSRF-guard middleware. Only rejects requests that would
- * authenticate via the httpOnly `jwt` cookie and whose Origin/Referer does
- * not match an allowed origin.
- *
- * @param {string} [allowedOriginsEnv] Defaults to process.env.ALLOWED_ORIGINS.
+ * Write a readable CSRF cookie and return the token that was stored.
+ * Called when a session is established (login) or when a client explicitly
+ * requests a token from `GET /api/auth/csrf`.
  */
-function csrfOriginCheck(allowedOriginsEnv = process.env.ALLOWED_ORIGINS) {
-  const { origins: allowedOrigins } = parseAllowedOrigins(allowedOriginsEnv);
-
-  return function (req, res, next) {
-    // Bearer-authenticated (non-browser) requests are not cookie-driven and
-    // therefore cannot be forged cross-site — nothing to check.
-    if (hasBearerToken(req)) {
-      return next();
-    }
-
-    // No cookie present either — extractToken will fail auth downstream with
-    // its own 401; this middleware only guards the cookie path.
-    const hasCookieToken = typeof req.cookies?.jwt === "string";
-    if (!hasCookieToken) {
-      return next();
-    }
-
-    const origin = req.headers.origin || originFromReferer(req.headers.referer);
-
-    if (!origin || !allowedOrigins.includes(origin)) {
-      return res.status(403).json({
-        error: "Forbidden: request origin is not allowed for cookie-authenticated requests",
-      });
-    }
-
-    return next();
-  };
+function setCsrfCookie(res, token = generateCsrfToken()) {
+  res.cookie(CSRF_COOKIE, token, {
+    httpOnly: false, // must be readable by the frontend to echo it back
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    path: "/",
+    maxAge: 24 * 60 * 60 * 1000,
+  });
+  return token;
 }
 
-module.exports = { csrfOriginCheck };
+/**
+ * Double-submit verification for state-changing requests.
+ *
+ * - Safe methods (GET/HEAD/OPTIONS) are never blocked.
+ * - Requests without cookies carry no ambient authority, so they are allowed
+ *   (stateless / bearer-token clients are not CSRF-susceptible).
+ * - Requests that carry cookies must present an `X-CSRF-Token` header matching
+ *   the `csrfToken` cookie.
+ */
+function csrfProtection(req, res, next) {
+  if (SAFE_METHODS.has(req.method)) return next();
+
+  const cookies = parseCookies(req.headers.cookie);
+  const hasCookies = Object.keys(cookies).length > 0;
+
+  // No cookies => no ambient credentials => nothing for CSRF to hijack.
+  if (!hasCookies) return next();
+
+  const cookieToken = cookies[CSRF_COOKIE];
+  const headerToken = req.get(CSRF_HEADER);
+
+  if (!cookieToken || !headerToken || !tokensMatch(cookieToken, headerToken)) {
+    return res
+      .status(403)
+      .json({ error: "Forbidden: invalid or missing CSRF token" });
+  }
+
+  return next();
+}
+
+module.exports = {
+  csrfProtection,
+  setCsrfCookie,
+  generateCsrfToken,
+  parseCookies,
+  tokensMatch,
+  CSRF_COOKIE,
+  CSRF_HEADER,
+};

@@ -3,17 +3,21 @@
  * Banner shown when a payment request comes from an external URI
  */
 
+import { useTranslation } from "@/contexts/I18nContext";
+
 interface ExternalPaymentBannerProps {
   message?: string;
   originDomain?: string;
   onDismiss: () => void;
 }
 
-export default function ExternalPaymentBanner({ 
-  message, 
-  originDomain, 
-  onDismiss 
+export default function ExternalPaymentBanner({
+  message,
+  originDomain,
+  onDismiss
 }: ExternalPaymentBannerProps) {
+  const { t } = useTranslation();
+
   return (
     <div className="bg-stellar-500/10 border border-stellar-500/20 rounded-lg p-4 mb-6 animate-slide-up">
       <div className="flex items-start gap-3">
@@ -22,25 +26,25 @@ export default function ExternalPaymentBanner({
             <ExternalLinkIcon className="w-4 h-4 text-stellar-400" />
           </div>
         </div>
-        
+
         <div className="flex-1 min-w-0">
           <h3 className="text-sm font-medium text-stellar-300 mb-1">
-            Payment request from external app
+            {t("externalPayment.title")}
           </h3>
           <p className="text-xs text-slate-400 mb-2">
-            {message || 'Send a payment using the pre-filled form below.'}
+            {message || t("externalPayment.defaultMessage")}
           </p>
           {originDomain && (
-            <p className="text-xs text-slate-400">
-              Origin: <span className="font-mono">{originDomain}</span>
+            <p className="text-xs text-slate-500">
+              {t("externalPayment.origin")} <span className="font-mono">{originDomain}</span>
             </p>
           )}
         </div>
-        
+
         <button
           onClick={onDismiss}
           className="flex-shrink-0 p-1 rounded-md text-slate-400 hover:text-slate-300 hover:bg-white/5 transition-colors"
-          aria-label="Dismiss"
+          aria-label={t("externalPayment.dismiss")}
         >
           <CloseIcon className="w-4 h-4" />
         </button>
